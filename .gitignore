@@ -1,0 +1,13 @@
+node_modules/
+*.tgz
+*.zip
+
+# editor / OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# local scratch
+*.log
+tmp/

@@ -1,0 +1,3 @@
+- insert:
+    - id: quota-meter
+      name: dsh-meter

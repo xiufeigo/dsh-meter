@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "额度仪表",
+    "description": "在输入框下方显示当前模型套餐的剩余额度圆环，点开可看每一档额度的重置时间。支持 MiniMax、Kimi、OpenCode Go、StepFun、小米 MiMo。"
+  }
+}

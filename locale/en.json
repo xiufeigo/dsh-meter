@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Quota Meter",
+    "description": "A usage ring under the composer showing the current model plan's headroom, with a click-open panel of every window's reset time. Supports MiniMax, Kimi, OpenCode Go, StepFun, and Xiaomi MiMo."
+  }
+}
