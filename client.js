@@ -109,8 +109,15 @@ window.__ModuleLoader__.load({
         w30d: 'Monthly',
         w1y: 'Yearly',
         wBalance: 'Balance',
+        wBonus: 'Granted',
         wPlan: 'Plan',
         wOther: 'Window',
+        familyDeepseekAccount: 'DeepSeek Account',
+        familyDeepseek: 'DeepSeek',
+        notConnected: 'Not linked',
+        balanceNote: 'Balance plans (reuse the signed-in account or API key, nothing to bind)',
+        apiKeyHint: 'MiniMax · Kimi · OpenCode Go — the badge reports the fastest-refreshing window (rolling first, otherwise weekly / monthly).',
+        balanceHint: 'DeepSeek Account / DeepSeek — balance-metered, so the badge shows the remaining amount.',
       },
       zh: {
         settingsNav: '额度徽章',
@@ -162,8 +169,15 @@ window.__ModuleLoader__.load({
         w30d: '月',
         w1y: '年',
         wBalance: '余额',
+        wBonus: '赠送',
         wPlan: '套餐',
         wOther: '窗口',
+        familyDeepseekAccount: 'DeepSeek 账号',
+        familyDeepseek: 'DeepSeek',
+        notConnected: '未连接',
+        balanceNote: '余额类（复用已登录账号 / API Key，无需绑定）',
+        apiKeyHint: 'MiniMax · Kimi · OpenCode Go — 徽章显示刷新周期最短的那一档额度（有滚动就显示滚动，没有滚动才退到周 / 月）。',
+        balanceHint: 'DeepSeek 账号 / DeepSeek — 按余额计量，徽章直接显示剩余金额。',
       },
     }
     DICTS['zh-CN'] = DICTS.zh
@@ -192,6 +206,7 @@ window.__ModuleLoader__.load({
       '30d': 'w30d',
       '1y': 'w1y',
       balance: 'wBalance',
+      bonus: 'wBonus',
       plan: 'wPlan',
       week: 'w7d',
       month: 'w30d',
@@ -342,6 +357,13 @@ window.__ModuleLoader__.load({
     function windowLabel (key, t) {
       const id = WINDOW_LABEL[key]
       return id === undefined ? t('wOther') : t(id)
+    }
+
+    /** Provider name for the panel and badge title, localized for the official routes. */
+    function familyLabel (data, t) {
+      if (data?.family === 'deepseek-account') return t('familyDeepseekAccount')
+      if (data?.family === 'deepseek-official') return t('familyDeepseek')
+      return String(data?.providerLabel ?? data?.family ?? data?.provider ?? '')
     }
 
     function resetText (win) {
@@ -567,7 +589,7 @@ window.__ModuleLoader__.load({
         style: position ?? { visibility: 'hidden', left: 0, top: 0 },
       },
       h('div', { className: 'qm-head' },
-        h('span', { className: 'qm-head-title' }, String(data.providerLabel ?? data.family ?? data.provider ?? '')),
+        h('span', { className: 'qm-head-title' }, familyLabel(data, t)),
         h('span', { className: 'qm-head-sub' }, t('windowsTitle')),
         remaining !== null
           ? h('span', { className: 'qm-head-fig' }, `${t('remaining')} ${Math.round(remaining)}%`)
@@ -889,17 +911,24 @@ window.__ModuleLoader__.load({
       const primary = primaryWindow(windows)
       const remaining = remainingOf(primary)
       const tone = toneOf(remaining)
+      // Balance-only plans have no percentage window: the first text row (the
+      // total balance) is the headline the compact badge shows instead.
+      const primaryText = texts.find((win) => win.key === 'balance') ?? texts[0] ?? null
+      const providerName = familyLabel(data, t) || provider
       const boundPlan = CONSOLE_PLANS.find((plan) => plan.family === bindFamily)
 
       let trigger = null
       if (data.status === 'ok' && (windows.length > 0 || texts.length > 0)) {
         const label = windows.length > 0
           ? `${Math.round(remaining)}%`
-          : String(texts[0].text)
+          : String(primaryText.text)
         const title = [
-          String(data.providerLabel ?? provider),
+          providerName,
           primary === null ? '' : `${windowLabel(primary.key, t)} ${primary.key}`,
           windows.length > 0 ? `${t('remaining')} ${Math.round(remaining)}%` : '',
+          windows.length === 0 && primaryText !== null
+            ? `${windowLabel(primaryText.key, t)} ${primaryText.text}`
+            : '',
         ].filter((part) => part.length > 0).join(' · ')
         // Every badge opens: even one window has a reset date worth reading.
         const expandable = windows.length + texts.length > 0
@@ -926,7 +955,7 @@ window.__ModuleLoader__.load({
           onClick: () => { if (plan !== undefined) setBindFamily(family); else setOpen(true) },
         },
         h(RingMark, { percent: 0, tone: '' }),
-        h('span', null, `🔒 ${t('bind')}`))
+        h('span', null, plan === undefined ? `🔒 ${t('notConnected')}` : `🔒 ${t('bind')}`))
       } else if (data.status === 'error') {
         trigger = h('button', {
           ref: triggerRef,
@@ -944,7 +973,7 @@ window.__ModuleLoader__.load({
           ref: triggerRef,
           type: 'button',
           className: 'qm-trigger qm-static',
-          title: String(data.providerLabel ?? provider),
+          title: providerName,
         },
         h(RingMark, { percent: 0, tone: '' }),
         h('span', null, '…'))
@@ -994,6 +1023,36 @@ window.__ModuleLoader__.load({
       )
     }
 
+    /**
+     * A read-only card for the two official DeepSeek routes: both are
+     * balance-metered and reuse credentials the user already configured, so
+     * there is nothing to bind here.
+     */
+    function BalanceCard ({ family, title, t }) {
+      const [nonce, setNonce] = React.useState(0)
+      const data = useJson(`${QUOTA_URL}?family=${encodeURIComponent(family)}`, nonce)
+      let status = h('span', { className: 'qm-note' }, t('loading'))
+      if (data.status === 'ok') {
+        const rows = textWindows(data).map((win) => `${windowLabel(win.key, t)} ${win.text}`)
+        status = h('span', { className: 'qm-ok' }, `✓ ${rows.join(' · ') || 'ok'}`)
+      } else if (data.status === 'no-credential') {
+        status = h('span', { className: 'qm-note' }, String(data.message ?? t('notConnected')))
+      } else if (data.status === 'error') {
+        status = h('span', { className: 'qm-error' }, String(data.message ?? t('queryFailed')))
+      }
+      return h('div', { className: 'qm-card' },
+        h('div', { className: 'qm-card-head' },
+          h('span', { className: 'qm-card-title' }, title),
+          status,
+        ),
+        h('button', {
+          type: 'button',
+          className: 'qm-link',
+          onClick: () => setNonce((n) => n + 1),
+        }, t('refresh')),
+      )
+    }
+
     function makeSettingsSection (t) {
       return function QuotaSettingsSection () {
         return h(Boundary, { channel: 'settings' },
@@ -1002,8 +1061,11 @@ window.__ModuleLoader__.load({
             h('div', { className: 'qm-sec' }, t('consoleNote')),
             CONSOLE_PLANS.map((plan) => h(ConsoleCard, { key: plan.family, plan, t })),
             h('div', { className: 'qm-sec' }, t('apiKeyNote')),
-            h('div', { className: 'qm-mini' },
-              'MiniMax · Kimi · OpenCode Go — 徽章显示刷新周期最短的那一档额度（有滚动就显示滚动，没有滚动才退到周 / 月）。'),
+            h('div', { className: 'qm-mini' }, t('apiKeyHint')),
+            h('div', { className: 'qm-mini' }, t('balanceHint')),
+            h('div', { className: 'qm-sec' }, t('balanceNote')),
+            h(BalanceCard, { family: 'deepseek-account', title: t('familyDeepseekAccount'), t }),
+            h(BalanceCard, { family: 'deepseek-official', title: t('familyDeepseek'), t }),
             h('div', { className: 'qm-mini' }, t('refreshHint')),
           ))
       }

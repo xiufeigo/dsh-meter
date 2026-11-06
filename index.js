@@ -107,6 +107,84 @@ function textWindow(key, text) {
   return s.length > 0 ? { key, percent: null, resetsAt: null, text: s } : null
 }
 
+/** Currency symbol for a wallet amount; an unknown currency keeps its code. */
+function currencySymbol(currency) {
+  const code = String(currency ?? '').toUpperCase()
+  if (code === 'CNY') return '¥'
+  if (code === 'USD') return '$'
+  return code.length > 0 ? `${code} ` : ''
+}
+
+/**
+ * Render a wallet amount the way a console headline would: two decimals, and
+ * `<¥0.01` for a sub-cent remainder that would otherwise read as zero.
+ */
+function moneyText(value, currency) {
+  const n = Number(value)
+  if (!Number.isFinite(n)) return null
+  const symbol = currencySymbol(currency)
+  const sign = n < 0 ? '-' : ''
+  const abs = Math.abs(n)
+  if (abs > 0 && abs < 0.01) return `${sign}<${symbol}0.01`
+  return `${sign}${symbol}${abs.toFixed(2)}`
+}
+
+/** One text-only row: a wallet balance is money, not a percentage of a window. */
+function moneyWindow(key, value, currency) {
+  const text = moneyText(value, currency)
+  return text === null ? null : textWindow(key, text)
+}
+
+/** Pick the wallet to report: CNY when several currencies exist, else the first. */
+function preferredWallet(wallets) {
+  const list = Array.isArray(wallets)
+    ? wallets.filter((wallet) => wallet !== null && typeof wallet === 'object')
+    : []
+  return list.find((wallet) => String(wallet.currency ?? '').toUpperCase() === 'CNY') ?? list[0] ?? null
+}
+
+/**
+ * Balance rows for one wallet pair: the usable total plus the granted slice
+ * when it is non-zero. The two official DeepSeek routes are pay-as-you-go, so
+ * no percentage window exists and the badge reads the remaining amount instead.
+ */
+function balanceWindows({ total, granted, currency }) {
+  const windows = []
+  const totalWindow = moneyWindow('balance', total, currency)
+  if (totalWindow !== null) windows.push(totalWindow)
+  const grantedValue = Number(granted)
+  if (Number.isFinite(grantedValue) && grantedValue > 0) {
+    const bonusWindow = moneyWindow('bonus', granted, currency)
+    if (bonusWindow !== null) windows.push(bonusWindow)
+  }
+  return windows
+}
+
+/** The account route reports normal + bonus wallets; the badge shows their sum. */
+function deepseekAccountWindows(balance) {
+  const normals = Array.isArray(balance?.value) ? balance.value : []
+  const bonuses = Array.isArray(balance?.bonusWallets) ? balance.bonusWallets : []
+  const currency = preferredWallet(normals)?.currency ?? preferredWallet(bonuses)?.currency ?? 'CNY'
+  const walletCode = String(currency).toUpperCase()
+  const sum = (wallets) => wallets
+    .filter((wallet) => wallet !== null && typeof wallet === 'object'
+      && String(wallet.currency ?? '').toUpperCase() === walletCode)
+    .reduce((total, wallet) => total + (Number(wallet.balance) || 0), 0)
+  const granted = sum(bonuses)
+  return balanceWindows({ total: sum(normals) + granted, granted, currency })
+}
+
+/** The API-key route reports one summary row per currency. */
+function deepseekOfficialWindows(data) {
+  const wallet = preferredWallet(data?.balance_infos)
+  if (wallet === null) return []
+  return balanceWindows({
+    total: wallet.total_balance,
+    granted: wallet.granted_balance,
+    currency: wallet.currency,
+  })
+}
+
 async function fetchJson(url, { method = 'GET', headers = {}, body, timeoutMs = 12_000, attempts = 3 } = {}) {
   let response = null
   for (let attempt = 1; ; attempt += 1) {
@@ -207,7 +285,45 @@ function configEditorDiagnostics(ctx) {
   return out
 }
 
+/**
+ * Read the official API-key route's settings (endpoint and credential name)
+ * from the `llm-deepseek` configuration entry. Both fields are optional and
+ * fall back to the shipped defaults.
+ */
+function readDeepseekRoute(ctx) {
+  const out = {}
+  const editor = ctx.get('configEditor')
+  if (editor === undefined || typeof editor.configuration !== 'function') return out
+  try {
+    for (const row of editor.configuration()) {
+      const id = row?.entry?.id
+      const moduleName = String(row?.entry?.name ?? row?.entry?.moduleName ?? '')
+      const isRoute = id === 'llm-deepseek' || moduleName.endsWith('dsh-llm-deepseek-api-key')
+      if (!isRoute) continue
+      const layers = [row?.inherited, row?.override, row?.entry?.config, row?.config]
+      for (const layer of layers) {
+        if (layer === null || typeof layer !== 'object') continue
+        if (out.baseURL === undefined && typeof layer.baseURL === 'string' && layer.baseURL.trim().length > 0) {
+          out.baseURL = layer.baseURL.trim()
+        }
+        if (out.apiKeyEnv === undefined && typeof layer.apiKeyEnv === 'string' && layer.apiKeyEnv.trim().length > 0) {
+          out.apiKeyEnv = layer.apiKeyEnv.trim()
+        }
+      }
+      break
+    }
+  } catch {
+    // Config surface unavailable: the shipped defaults still apply.
+  }
+  return out
+}
+
 function detectFamily(ns, baseURL) {
+  const name = String(ns ?? '').trim().toLowerCase()
+  // The two official DeepSeek routes serve the same models, so only the
+  // provider id can tell them apart; a baseURL match would be ambiguous.
+  if (name === 'deepseek-account') return 'deepseek-account'
+  if (name === 'deepseek-official' || name === 'deepseek') return 'deepseek-official'
   const s = `${ns ?? ''} ${baseURL ?? ''}`.toLowerCase()
   if (s.includes('stepfun')) return 'stepfun'
   // Every Xiaomi route (console MiMo, `xiaomi`, `xiaomi-token-plan-cn|ams|sgp`)
@@ -225,6 +341,8 @@ const FAMILY_LABELS = {
   'opencode-go': 'OpenCode Go',
   stepfun: 'StepFun',
   mimo: 'MiMo',
+  'deepseek-account': 'DeepSeek Account',
+  'deepseek-official': 'DeepSeek',
 }
 
 const FAMILY_KEY_ENVS = {
@@ -233,6 +351,9 @@ const FAMILY_KEY_ENVS = {
   'opencode-go': ['OPENCODE_GO_API_KEY', 'OPENCODEGORESPONSE_API_KEY', 'OPENCODE_GO_CHAT_API_KEY'],
   stepfun: ['STEPFUN_COOKIE'],
   mimo: ['MIMO_COOKIE', 'XIAOMI_MIMO_COOKIE'],
+  // The official API-key route defaults to DEEPSEEK_API_KEY; a settings
+  // override is read from the llm-deepseek entry when it is configured.
+  'deepseek-official': ['DEEPSEEK_API_KEY'],
 }
 
 const CONSOLE_TARGETS = {
@@ -800,6 +921,55 @@ async function queryMimo(cookie) {
   return parseMimoRaw(usage.data, detail?.data)
 }
 
+/** The open platform origin whose `/user/balance` bills this API key. */
+function deepseekOfficialOrigin(route = {}) {
+  const configured = String(route.baseURL ?? process.env.DEEPSEEK_BASE_URL ?? '').trim()
+  if (configured.length > 0) {
+    try {
+      return new URL(configured).origin
+    } catch {
+      // Fall through to the public origin.
+    }
+  }
+  return 'https://api.deepseek.com'
+}
+
+/**
+ * The API-key route is balance-metered: `GET /user/balance` is the only public
+ * quota endpoint, so the meter reports the remaining money, not a percentage.
+ */
+async function queryDeepSeekOfficial(key, route = {}) {
+  const { status, ok, data } = await fetchJson(`${deepseekOfficialOrigin(route)}/user/balance`, {
+    headers: { authorization: `Bearer ${key}`, accept: 'application/json' },
+  })
+  if (status === 401 || status === 403) throw httpError(502, `DeepSeek rejected the API key (HTTP ${status})`)
+  if (!ok) throw httpError(502, `DeepSeek balance endpoint failed (HTTP ${status || 'network'})`)
+  const windows = deepseekOfficialWindows(data)
+  if (windows.length === 0) throw httpError(502, 'DeepSeek balance response carries no wallet')
+  return windows
+}
+
+/** Client identity the DeepSeek account service forwards to the platform. */
+function dshClientVersion(ctx) {
+  try {
+    const release = ctx.get('clientModules')?.release
+    if (release !== null && typeof release === 'object'
+      && typeof release.version === 'string' && release.version.length > 0) return release.version
+  } catch {
+    // Older compositions may not expose the client module registry.
+  }
+  const fromEnv = String(process.env.DSH_CLIENT_VERSION ?? '').trim()
+  return fromEnv.length > 0 ? fromEnv : '0.0.0'
+}
+
+function accountClientMetadata(ctx) {
+  return {
+    version: dshClientVersion(ctx),
+    locale: 'zh-CN',
+    timezoneOffsetSeconds: -new Date().getTimezoneOffset() * 60,
+  }
+}
+
 // ── plugin ────────────────────────────────────────────────────────────
 
 export function apply(ctx, config = {}) {
@@ -894,6 +1064,11 @@ export function apply(ctx, config = {}) {
       if (configured.length > 0) return configured
       return resolveCredential(ctx, FAMILY_KEY_ENVS[family] ?? [])
     }
+    if (family === 'deepseek-official') {
+      // The route's credential name is configurable on the llm-deepseek entry.
+      const route = readDeepseekRoute(ctx)
+      return resolveCredential(ctx, [route.apiKeyEnv, ...(FAMILY_KEY_ENVS[family] ?? [])])
+    }
     const envs = [...(row?.apiKeyEnv !== undefined ? [String(row.apiKeyEnv)] : []), ...(FAMILY_KEY_ENVS[family] ?? [])]
     return resolveCredential(ctx, envs)
   }
@@ -904,7 +1079,75 @@ export function apply(ctx, config = {}) {
     if (family === 'opencode-go') return queryOpenCodeGo(secret)
     if (family === 'stepfun') return queryStepfun(secret)
     if (family === 'mimo') return queryMimo(secret)
+    if (family === 'deepseek-official') return queryDeepSeekOfficial(secret, readDeepseekRoute(ctx))
     throw httpError(400, `unknown quota family "${family}"`)
+  }
+
+  /**
+   * The account route is not key-based: it reads the signed-in DeepSeek
+   * account's wallet through the harness account service, so the plugin never
+   * touches the account grant itself.
+   */
+  async function queryDeepSeekAccount() {
+    const account = ctx.get('deepseekAccount')
+    if (account === undefined || account === null || typeof account.getBalance !== 'function') {
+      throw httpError(502, 'this DeepSeek Harness build exposes no DeepSeek account service')
+    }
+    const balance = await account.getBalance(accountClientMetadata(ctx))
+    if (balance === null) return null
+    if (balance.status !== 'ready') throw httpError(502, 'DeepSeek account balance is unavailable right now')
+    const windows = deepseekAccountWindows(balance)
+    if (windows.length === 0) throw httpError(502, 'DeepSeek account reports no wallet balance')
+    return windows
+  }
+
+  async function quotaForDeepSeekAccount(provider) {
+    const cacheKey = `deepseek-account:${provider}`
+    const hit = cache.get(cacheKey)
+    if (hit !== undefined && Date.now() - hit.at < hit.ttl) return { ...hit.value, provider }
+    const running = inflight.get(cacheKey)
+    if (running !== undefined) return running
+    const promise = (async () => {
+      try {
+        const windows = await queryDeepSeekAccount()
+        if (windows === null) {
+          const value = {
+            status: 'no-credential',
+            family: 'deepseek-account',
+            providerLabel: FAMILY_LABELS['deepseek-account'],
+            setupFamily: null,
+            message: 'DeepSeek account is not signed in — sign in from Settings → Account, then refresh',
+            windows: [],
+          }
+          cache.set(cacheKey, { at: Date.now(), ttl: ERROR_TTL_MS, value })
+          return { ...value, provider }
+        }
+        const value = {
+          status: 'ok',
+          family: 'deepseek-account',
+          providerLabel: FAMILY_LABELS['deepseek-account'],
+          fetchedAt: Date.now(),
+          windows,
+        }
+        cache.set(cacheKey, { at: Date.now(), ttl: OK_TTL_MS, value })
+        return { ...value, provider }
+      } catch (error) {
+        const value = {
+          status: 'error',
+          family: 'deepseek-account',
+          providerLabel: FAMILY_LABELS['deepseek-account'],
+          fetchedAt: Date.now(),
+          message: error?.httpStatus !== undefined ? error.message : `quota query failed: ${error?.message ?? String(error)}`,
+          windows: [],
+        }
+        cache.set(cacheKey, { at: Date.now(), ttl: ERROR_TTL_MS, value })
+        return { ...value, provider }
+      } finally {
+        inflight.delete(cacheKey)
+      }
+    })()
+    inflight.set(cacheKey, promise)
+    return promise
   }
 
   async function quotaFor(provider, model, familyOverride) {
@@ -924,6 +1167,7 @@ export function apply(ctx, config = {}) {
       const mimoSecret = await secretFor('mimo', {})
       if (mimoSecret !== null && mimoCookieUsable(mimoSecret)) family = 'mimo'
     }
+    if (family === 'deepseek-account') return quotaForDeepSeekAccount(provider)
     const secret = await secretFor(family, row)
     const isConsole = family === 'stepfun' || family === 'mimo'
     if (secret === null) {
@@ -1274,8 +1518,21 @@ document.getElementById('save').onclick = async () => {
           const family = url.searchParams.get('family') ?? 'opencode-go'
           const provider = url.searchParams.get('provider') ?? ''
           const row = provider.length > 0 ? (readProviderRows(ctx)[provider] ?? {}) : {}
+          if (family === 'deepseek-account') {
+            const account = ctx.get('deepseekAccount')
+            if (account === undefined || typeof account.getBalance !== 'function') {
+              return json(res, 200, { status: 'no-account-service', family })
+            }
+            return json(res, 200, { family, balance: await account.getBalance(accountClientMetadata(ctx)) })
+          }
           const secret = await secretFor(family, row)
           if (secret === null) return json(res, 200, { status: 'no-credential', family })
+          if (family === 'deepseek-official') {
+            const { status, data } = await fetchJson(`${deepseekOfficialOrigin(readDeepseekRoute(ctx))}/user/balance`, {
+              headers: { authorization: `Bearer ${secret}`, accept: 'application/json' },
+            })
+            return json(res, 200, { status, family, data })
+          }
           if (family === 'stepfun') {
             const base = 'https://platform.stepfun.com/api/step.openapi.devcenter.Dashboard'
             const oasisWebid = /Oasis-Webid=([^;]+)/i.exec(secret)?.[1] ?? ''
@@ -1437,6 +1694,16 @@ document.getElementById('save').onclick = async () => {
         }
         const rows = readProviderRows(ctx)
         out.providerFamilies = Object.fromEntries(Object.keys(rows).map((ns) => [ns, detectFamily(ns, rows[ns]?.baseURL)]))
+        out.officialFamilies = {
+          'deepseek-account': detectFamily('deepseek-account'),
+          'deepseek-official': detectFamily('deepseek-official'),
+        }
+        out.deepseekRoute = readDeepseekRoute(ctx)
+        const account = ctx.get('deepseekAccount')
+        out.deepseekAccount = account === undefined
+          ? { present: false }
+          : { present: true, getBalance: typeof account.getBalance === 'function' }
+        out.clientVersion = dshClientVersion(ctx)
         out.configEditor = configEditorDiagnostics(ctx)
         out.credentials = await credentialDiagnostics(ctx)
         out.clientLog = CLIENT_LOG.slice(-30)

@@ -270,6 +270,85 @@ if (!text.includes('剩余 99%')) problems.push('single window: header must keep
 if (!text.includes('重置')) problems.push('single window: reset date must render')
 if (text.includes('30d')) problems.push('single window: the 月/30d row must not repeat')
 
+// ── 10. balance-only official route: account badge + panel ───────────
+activeLocale = 'zh'
+const accountPayload = {
+  status: 'ok', family: 'deepseek-account', providerLabel: 'DeepSeek Account',
+  fetchedAt: Date.now(), provider: 'deepseek-account',
+  windows: [
+    { key: 'balance', percent: null, resetsAt: null, text: '¥12.34' },
+    { key: 'bonus', percent: null, resetsAt: null, text: '¥2.00' },
+  ],
+}
+tree = renderCell('conversation.composer.dock', {
+  useProjection: selectionOf('deepseek-account', 'deepseek-flash'),
+  t,
+}, [false, null, 0, accountPayload])
+text = toText(tree)
+notes.push(`[balance-closed-zh] ${text.trim()}`)
+if (!text.includes('¥12.34')) problems.push(`balance badge: expected the total balance, got "${text.trim()}"`)
+if (text.includes('%')) problems.push('balance badge: must not render a percentage')
+
+tree = renderCell('conversation.composer.dock', {
+  useProjection: selectionOf('deepseek-account', 'deepseek-flash'),
+  t,
+}, [true, null, 0, accountPayload])
+text = toText(tree)
+notes.push(`[balance-open-zh] ${text.trim()}`)
+for (const expected of ['DeepSeek 账号', '额度限制', '余额', '¥12.34', '赠送', '¥2.00', '刷新']) {
+  if (!text.includes(expected)) problems.push(`balance panel: missing "${expected}"`)
+}
+
+// ── 11. balance-only official route: API-key badge ────────────────────
+const officialPayload = {
+  status: 'ok', family: 'deepseek-official', providerLabel: 'DeepSeek',
+  fetchedAt: Date.now(), provider: 'deepseek-official',
+  windows: [{ key: 'balance', percent: null, resetsAt: null, text: '¥8.00' }],
+}
+tree = renderCell('conversation.composer.dock', {
+  useProjection: selectionOf('deepseek-official', 'deepseek-flash'),
+  t,
+}, [false, null, 0, officialPayload])
+text = toText(tree)
+notes.push(`[official-closed-zh] ${text.trim()}`)
+if (!text.includes('¥8.00')) problems.push(`official badge: expected the balance, got "${text.trim()}"`)
+
+tree = renderCell('conversation.composer.dock', {
+  useProjection: selectionOf('deepseek-official', 'deepseek-flash'),
+  t,
+}, [true, null, 0, officialPayload])
+text = toText(tree)
+notes.push(`[official-open-zh] ${text.trim()}`)
+for (const expected of ['DeepSeek', '余额', '¥8.00']) {
+  if (!text.includes(expected)) problems.push(`official panel: missing "${expected}"`)
+}
+
+// ── 12. signed-out account: not a console binding ─────────────────────
+tree = renderCell('conversation.composer.dock', {
+  useProjection: selectionOf('deepseek-account', 'deepseek-flash'),
+  t,
+}, [false, null, 0, {
+  status: 'no-credential', family: 'deepseek-account', providerLabel: 'DeepSeek Account',
+  setupFamily: null, message: 'DeepSeek account is not signed in', windows: [],
+}])
+text = toText(tree)
+notes.push(`[account-signed-out-zh] ${text.trim()}`)
+if (!text.includes('未连接')) problems.push(`signed-out account: expected 未连接, got "${text.trim()}"`)
+if (text.includes('绑定')) problems.push('signed-out account: must not ask to bind a console cookie')
+
+// ── 13. english balance panel ─────────────────────────────────────────
+activeLocale = 'en'
+tree = renderCell('conversation.composer.dock', {
+  useProjection: selectionOf('deepseek-account', 'deepseek-flash'),
+  t,
+}, [true, null, 0, accountPayload])
+text = toText(tree)
+notes.push(`[balance-open-en] ${text.trim()}`)
+for (const expected of ['DeepSeek Account', 'Usage limits', 'Balance', 'Granted', '¥12.34']) {
+  if (!text.includes(expected)) problems.push(`en balance panel: missing "${expected}"`)
+}
+activeLocale = 'zh'
+
 // ── report ────────────────────────────────────────────────────────────
 console.log(notes.join('\n\n'))
 console.log(`\nused locale keys: ${[...usedKeys].sort().join(', ')}`)

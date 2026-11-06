@@ -1,9 +1,9 @@
 {
   "name": "dsh-meter",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "type": "module",
-  "description": "A usage ring under the DSH composer showing the current model plan's headroom, with per-window reset dates and one-click console sign-in.",
+  "description": "A usage ring under the DSH composer showing the current model plan's headroom (or remaining balance for balance-metered routes), with per-window reset dates and one-click console sign-in.",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -22,6 +22,7 @@
     "minimax",
     "kimi",
     "opencode",
+    "deepseek",
     "stepfun",
     "xiaomi-mimo"
   ],

@@ -26,6 +26,7 @@
 
 - **收起态**只占一个 14px 圆环 + 百分比，不抢位置
 - **展开态**列出每一档额度（滚动 / 周 / 月 / 年）、各自的百分比和重置时间
+- 按余额计量的套餐（DeepSeek 官方）没有百分比，收起态直接显示剩余金额，展开态列出充值 / 赠送明细
 - 颜色跟随 DSH 主题 token，深浅色主题都自适应
 
 ## 支持
@@ -35,10 +36,14 @@
 | **MiniMax** | `token_plan/remains` | 否，复用已有 API Key |
 | **Kimi** | `coding/v1/usages` | 否，复用已有 API Key |
 | **OpenCode Go** | `zen/go/v1/usage` | 否，复用已有 API Key |
+| **DeepSeek 账号** | DSH 账号钱包余额（`deepseekAccount.getBalance`） | 否，复用已登录的 DSH 账号 |
+| **DeepSeek** | `GET /user/balance` | 否，复用已有 API Key |
 | **StepFun** | 控制台 `QueryStepPlanRateLimit` | 是，浏览器登录一次 |
 | **小米 MiMo** | 控制台 `tokenPlan/usage` | 是，浏览器登录一次 |
 
 小米的几个通道都能识别：`xiaomi`、`xiaomi-token-plan-cn`、`xiaomi-token-plan-ams`、`xiaomi-token-plan-sgp`、以及走 OpenCode Go 转发但模型名是 `mimo-*` 的情况。
+
+两条 DeepSeek 官方通道都是**按余额计量**（预充值 / 赠送额度），没有「滚动 / 周」这类百分比窗口，所以徽章显示的是剩余金额（如 `¥58.04`）而不是圆环百分比；`DeepSeek 账号` 走 DSH 已登录的账号，`DeepSeek` 走模型设置里的 `DEEPSEEK_API_KEY`。
 
 ## 安装
 
@@ -73,7 +78,9 @@ dsh plugin --profile desktop add "github:xiufeigo/dsh-meter"
 
 ### API Key 类：开箱即用
 
-MiniMax / Kimi / OpenCode Go 直接复用「设置 → 模型」里已经配好的 API Key，装完就能看到数字。
+MiniMax / Kimi / OpenCode Go / DeepSeek 直接复用「设置 → 模型」里已经配好的 API Key，装完就能看到数字。
+
+**DeepSeek 账号**则复用 DSH「设置 → 账号」里已登录的账号：插件通过 DSH 的账号服务读取钱包余额，自己**不接触**账号令牌；没登录时徽章显示 `🔒 未连接`，登录后刷新即可。
 
 ### 控制台类：登录一次
 
@@ -95,6 +102,7 @@ MiniMax / Kimi / OpenCode Go 直接复用「设置 → 模型」里已经配好�
 |---|---|
 | 只有一档额度 | 圆环 + 百分比；点开显示重置**日期**，不重复画行 |
 | 多档额度 | 圆环显示**刷新周期最短**那档（有滚动就显示滚动） |
+| 按余额计量（DeepSeek 官方） | 不画百分比圆环，直接显示剩余金额（`¥58.04`）；点开可看充值 / 赠送明细 |
 | 重置在 24 小时内 | `34m后重置` |
 | 重置超过 24 小时 | `重置 11-09 08:00` |
 | 剩余 ≤ 30% | 琥珀色 |
@@ -126,6 +134,9 @@ MiniMax / Kimi / OpenCode Go 直接复用「设置 → 模型」里已经配好�
   每 2 分钟同步一次 Cookie；查询遇到 401 会先自动重试一次，连续失败 3 次就自动关掉。
 - **徽章位置**在 `conversation.composer.dock` 插槽里。DSH 的 dock 先渲染插槽再渲染上下文环，
   所以用 flex `order` 把自己的节点推到最后一个，落在上下文环右边。
+- **DeepSeek 官方**：`deepseek-account` 走 DSH 的 `deepseekAccount.getBalance()`（账号令牌不经过插件），
+  `deepseek-official` 走开放平台 `GET /user/balance`（`DEEPSEEK_API_KEY`）；两者都只有金额、没有百分比，
+  所以只返回文本行，界面不画圆环。
 - 界面侧只用 `react` / `react-dom`（DSH 的 module seed），**零第三方依赖、无构建步骤**。
 
 ## 开发
@@ -137,7 +148,10 @@ npm test          # 用假 React 渲染客户端两种状态，校验文案和 D
 npm run pack:release
 ```
 
-改完代码后重新安装一次即可（DSH 的插件是启动时装载的）：
+改完代码后：
+
+- **`link:` / 本地目录安装**：DSH 的 HMR 会检测到 linked 包的文件变化，host 代码随 profile 重组合自动重载；client 代码由客户端模块轮询自动重建（也可以 `GET /plugins/dsh-meter/hmr` 手动触发），页面不用刷新。
+- **`.tgz` / 打包安装**：需要重新 `dsh plugin --profile desktop add ...` 再重启 DSH（插件是启动时装载的）。
 
 ```powershell
 dsh plugin --profile desktop add "C:\path\to\dsh-meter"
@@ -157,7 +171,8 @@ dsh plugin --profile desktop add "C:\path\to\dsh-meter"
 - 依赖 DSH 的 `conversation.composer.dock` 与 `settings.plugins.tab` 两个 UI 插槽，随 DSH 版本变化；DSH < 0.2.2-rc.1 可能没有
 - 控制台登录需要 Chromium 系浏览器（Chrome / Edge / Brave / Vivaldi / Opera），Firefox 不支持 `--remote-debugging-pipe`
 - 控制台接口一旦改版，对应的解析要跟着改
-- 插件只把百分比、重置时间和套餐名回传给界面，**不显示也不外传任何密钥或 Cookie 内容**
+- DeepSeek 两条官方通道只有余额接口，没有公开的「套餐百分比」接口；余额接口改版时对应解析要跟着改
+- 插件只把百分比、余额、重置时间和套餐名回传给界面，**不显示也不外传任何密钥、Cookie 或账号令牌**
 
 ## License
 
