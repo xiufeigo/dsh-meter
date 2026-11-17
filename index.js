@@ -19,10 +19,18 @@
  *        (headless first when a saved profile is still signed in, otherwise a
  *        visible window), then watches that browser's cookies over the
  *        DevTools pipe and binds them the moment they pass a console check.
+ *   POST /plugins/dsh-meter/login/sync-edge?family=<stepfun|mimo>
+ *        Reads live cookies directly from a running Edge/Chrome browser via
+ *        DevToolsActivePort (enabled once at edge://inspect/#remote-debugging)
+ *        and binds or refreshes the console session without re-logging in.
  *   GET  /plugins/dsh-meter/login/status?family=...
  *        Phase of the running browser-login capture.
  *   POST /plugins/dsh-meter/login/cancel?family=...
  *        Stop watching and close the browser this plugin opened.
+ *   GET  /plugins/dsh-meter/providers?probe=1&force=1
+ *        Lists configured providers with detected or assigned quota families.
+ *   POST /plugins/dsh-meter/gateways
+ *        Assigns or clears a provider's Sub2API / New API gateway family.
  *   GET  /plugins/dsh-meter/hmr
  *        Ask the client module system to republish this package's browser
  *        bundle; the page's HMR receiver then re-materializes it in place.
@@ -238,10 +246,22 @@ function readProviderRows(ctx) {
   try {
     for (const row of editor.configuration()) {
       if (!isLlmPiAiRow(row)) continue
-      const inherited = (row.inherited ?? {}).providers ?? {}
-      const override = (row.override ?? {}).providers ?? {}
-      const merged = { ...inherited, ...override }
-      if (Object.keys(merged).length > 0) return merged
+      const inherited = row.inherited?.providers ?? {}
+      const override = row.override?.providers ?? {}
+      const keys = new Set([...Object.keys(inherited), ...Object.keys(override)])
+      if (keys.size > 0) {
+        const merged = {}
+        for (const key of keys) {
+          if (override[key] === null) continue
+          const a = inherited[key]
+          const b = override[key]
+          merged[key] = {
+            ...(a !== null && typeof a === 'object' ? a : {}),
+            ...(b !== null && typeof b === 'object' ? b : {}),
+          }
+        }
+        if (Object.keys(merged).length > 0) return merged
+      }
       const direct = row?.entry?.config?.providers ?? row?.config?.providers
       if (direct !== null && typeof direct === 'object') return direct
     }
@@ -318,6 +338,99 @@ function readDeepseekRoute(ctx) {
   return out
 }
 
+const OFFICIAL_FIRST_PARTY_DOMAINS = [
+  'openai.com',
+  'anthropic.com',
+  'googleapis.com',
+  'deepseek.com',
+  'moonshot.cn',
+  'moonshot.ai',
+  'kimi.com',
+  'minimax.chat',
+  'minimax.io',
+  'minimaxi.com',
+  'minimax.cn',
+  'opencode.ai',
+  'stepfun.com',
+  'xiaomimimo.com',
+  'xiaomi.com',
+  'mi.com',
+  'aliyuncs.com',
+  'openrouter.ai',
+  'siliconflow.cn',
+  'siliconflow.com',
+  'groq.com',
+  'x.ai',
+  'together.xyz',
+  'fireworks.ai',
+  'bigmodel.cn',
+  'volces.com',
+]
+
+/** Normalize a self-hosted gateway baseURL to its root origin+prefix without trailing `/v1`. */
+function gatewayRootUrl(baseURL) {
+  const trimmed = String(baseURL ?? '').trim().replace(/\/+$/, '')
+  if (trimmed.length === 0) return null
+  const stripped = trimmed.replace(/\/v1$/i, '')
+  try {
+    const parsed = new URL(stripped)
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null
+    return `${parsed.origin}${parsed.pathname}`.replace(/\/+$/, '')
+  } catch {
+    return null
+  }
+}
+
+function isOfficialFirstPartyUrl(baseURL) {
+  const root = gatewayRootUrl(baseURL)
+  if (root === null) return false
+  try {
+    const host = new URL(root).hostname.toLowerCase()
+    return OFFICIAL_FIRST_PARTY_DOMAINS.some((domain) => host === domain || host.endsWith(`.${domain}`))
+  } catch {
+    return false
+  }
+}
+
+function conventionalEnvName(provider) {
+  const clean = String(provider ?? '').trim().replace(/[^a-zA-Z0-9]+/g, '_').replace(/^_+|_+$/g, '').toUpperCase()
+  return clean.length > 0 ? `${clean}_API_KEY` : ''
+}
+
+function meterDataDir(config) {
+  return typeof config?.dataDir === 'string' && config.dataDir.trim().length > 0
+    ? config.dataDir.trim()
+    : path.join(os.homedir(), '.dsh', 'dsh-meter')
+}
+
+function gatewaysFileFor(dataDir) {
+  return path.join(dataDir, 'gateways.json')
+}
+
+function loadGatewayMap(dataDir) {
+  try {
+    const raw = JSON.parse(fs.readFileSync(gatewaysFileFor(dataDir), 'utf8'))
+    const providers = raw?.providers
+    if (providers === null || typeof providers !== 'object' || Array.isArray(providers)) return {}
+    const out = {}
+    for (const [key, value] of Object.entries(providers)) {
+      if (value === 'sub2api' || value === 'new-api' || value === 'none') out[key] = value
+    }
+    return out
+  } catch {
+    return {}
+  }
+}
+
+function saveGatewayMap(dataDir, map) {
+  fs.mkdirSync(dataDir, { recursive: true })
+  const clean = {}
+  for (const [key, value] of Object.entries(map ?? {})) {
+    if (value === 'sub2api' || value === 'new-api' || value === 'none') clean[key] = value
+  }
+  fs.writeFileSync(gatewaysFileFor(dataDir), JSON.stringify({ providers: clean }, null, 2), 'utf8')
+}
+
 function detectFamily(ns, baseURL) {
   const name = String(ns ?? '').trim().toLowerCase()
   // The two official DeepSeek routes serve the same models, so only the
@@ -325,6 +438,10 @@ function detectFamily(ns, baseURL) {
   if (name === 'deepseek-account') return 'deepseek-account'
   if (name === 'deepseek-official' || name === 'deepseek') return 'deepseek-official'
   const s = `${ns ?? ''} ${baseURL ?? ''}`.toLowerCase()
+  // Self-hosted gateways are recognized by their deployment URL; there is no
+  // fixed canonical host.
+  if (s.includes('sub2api')) return 'sub2api'
+  if (s.includes('new-api') || s.includes('newapi') || s.includes('one-api') || s.includes('oneapi') || s.includes('voapi') || s.includes('veloera')) return 'new-api'
   if (s.includes('stepfun')) return 'stepfun'
   // Every Xiaomi route (console MiMo, `xiaomi`, `xiaomi-token-plan-cn|ams|sgp`)
   // reports through the same MiMo console plan.
@@ -341,6 +458,8 @@ const FAMILY_LABELS = {
   'opencode-go': 'OpenCode Go',
   stepfun: 'StepFun',
   mimo: 'MiMo',
+  sub2api: 'Sub2API',
+  'new-api': 'New API',
   'deepseek-account': 'DeepSeek Account',
   'deepseek-official': 'DeepSeek',
 }
@@ -351,6 +470,9 @@ const FAMILY_KEY_ENVS = {
   'opencode-go': ['OPENCODE_GO_API_KEY', 'OPENCODEGORESPONSE_API_KEY', 'OPENCODE_GO_CHAT_API_KEY'],
   stepfun: ['STEPFUN_COOKIE'],
   mimo: ['MIMO_COOKIE', 'XIAOMI_MIMO_COOKIE'],
+  // The provider row's own apiKeyEnv wins; these are only conventional fallbacks.
+  sub2api: ['SUB2API_API_KEY'],
+  'new-api': ['NEW_API_KEY', 'NEWAPI_API_KEY', 'ONE_API_KEY', 'ONEAPI_API_KEY'],
   // The official API-key route defaults to DEEPSEEK_API_KEY; a settings
   // override is read from the llm-deepseek entry when it is configured.
   'deepseek-official': ['DEEPSEEK_API_KEY'],
@@ -413,21 +535,25 @@ const LOGIN_TARGETS = {
   },
   mimo: {
     loginUrl: 'https://platform.xiaomimimo.com/',
-    domains: ['xiaomimimo.com', 'mi.com'],
+    domains: ['xiaomimimo.com', 'xiaomi.com', 'mi.com'],
     label: 'MiMo',
   },
 }
 
 const LOGIN_POLL_MS = 2_000
-const LOGIN_QUICK_MS = 9_000
+const LOGIN_QUICK_MS = 15_000
 const LOGIN_TIMEOUT_MS = 10 * 60_000
 const LOGIN_BOUND_MARKER = '.dsh-bound'
+const LOGIN_JAR_FILE = '.dsh-jar.json'
 const LOGIN_SESSIONS = new Map()
 // One parked headless browser per bound console family: the console page keeps
 // its own session fresh, and we re-read the jar on a slow poll. Without this a
 // captured cookie dies within minutes (StepFun answers "token is expired").
 const KEEPALIVE = new Map()
 const KEEPALIVE_MS = 120_000
+// A parked page needs a few seconds to finish its own SSO/token round trip
+// before the jar holds a usable token again.
+const KEEPALIVE_FIRST_TICK_MS = 4_000
 
 const BROWSER_CANDIDATES = [
   'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
@@ -511,8 +637,8 @@ function findBrowser() {
   return null
 }
 
-function profileDirFor(family) {
-  return path.join(os.homedir(), '.dsh', 'dsh-meter', 'browser-profiles', family)
+function profileDirFor(family, dataDir = meterDataDir()) {
+  return path.join(dataDir, 'browser-profiles', family)
 }
 
 /**
@@ -529,6 +655,272 @@ function markProfileBound(dir) {
     fs.mkdirSync(dir, { recursive: true })
     fs.writeFileSync(path.join(dir, LOGIN_BOUND_MARKER), new Date().toISOString(), 'utf8')
   } catch { /* the marker is only an optimization */ }
+}
+
+// ── session-cookie resurrection ───────────────────────────────────────
+//
+// Chromium never persists session cookies, and a kill can also lose pending
+// writes. The consoles' long-lived credential (e.g. the StepFun SSO session on
+// account.stepfun.com) is exactly such a cookie, so a restarted profile is
+// always signed out even though the server-side session is still warm. We keep
+// a copy of the filtered jar (with domains) next to the profile and re-seed it
+// into every browser we open, which resurrects the dropped session cookies.
+
+function slimCookies(cookies) {
+  const out = []
+  for (const cookie of cookies ?? []) {
+    if (cookie === null || typeof cookie !== 'object') continue
+    if (typeof cookie.name !== 'string' || cookie.name.length === 0) continue
+    out.push({
+      name: cookie.name,
+      value: String(cookie.value ?? ''),
+      domain: String(cookie.domain ?? ''),
+      path: cookie.path ?? '/',
+      secure: cookie.secure === true,
+      httpOnly: cookie.httpOnly === true,
+      ...(['Strict', 'Lax', 'None'].includes(cookie.sameSite) ? { sameSite: cookie.sameSite } : {}),
+      ...(typeof cookie.expires === 'number' && cookie.expires > 0 ? { expires: cookie.expires } : {}),
+    })
+  }
+  return out
+}
+
+function loadJarCookies(profileDir) {
+  try {
+    const raw = JSON.parse(fs.readFileSync(path.join(profileDir, LOGIN_JAR_FILE), 'utf8'))
+    return Array.isArray(raw) ? raw : []
+  } catch {
+    return []
+  }
+}
+
+function persistJarCookies(profileDir, cookies) {
+  try {
+    fs.mkdirSync(profileDir, { recursive: true })
+    fs.writeFileSync(path.join(profileDir, LOGIN_JAR_FILE), JSON.stringify(slimCookies(cookies)), 'utf8')
+  } catch { /* the jar file is only an optimization */ }
+}
+
+/** Rebuild cookie objects from a stored `name=value; …` header on the family domains. */
+function headerCookiesFor(family, header) {
+  const domains = LOGIN_TARGETS[family]?.domains ?? []
+  const out = []
+  const seen = new Set()
+  for (const part of String(header ?? '').split(';')) {
+    const eq = part.indexOf('=')
+    if (eq <= 0) continue
+    const name = part.slice(0, eq).trim()
+    const value = part.slice(eq + 1).trim()
+    if (name.length === 0) continue
+    for (const domain of domains) {
+      const key = `${domain}${name}`
+      if (seen.has(key)) continue
+      seen.add(key)
+      out.push({ name, value, domain: `.${domain}`, path: '/' })
+    }
+  }
+  return out
+}
+
+function resurrectCookiesFor(family, profileDir, storedHeader) {
+  const jar = loadJarCookies(profileDir)
+  return jar.length > 0 ? jar : headerCookiesFor(family, storedHeader)
+}
+
+function mergeCookieLists(baseCookies, extraCookies) {
+  const merged = new Map()
+  for (const cookie of slimCookies(baseCookies)) {
+    merged.set(`${cookie.domain.toLowerCase()}\u0000${cookie.name}`, cookie)
+  }
+  for (const cookie of slimCookies(extraCookies)) {
+    merged.set(`${cookie.domain.toLowerCase()}\u0000${cookie.name}`, cookie)
+  }
+  return [...merged.values()]
+}
+
+function devToolsPortCandidates(config) {
+  if (typeof config?.edgeUserDataDir === 'string') {
+    const customDir = config.edgeUserDataDir.trim()
+    return customDir.length > 0
+      ? [{ browser: 'Microsoft Edge', file: path.join(customDir, 'DevToolsActivePort') }]
+      : []
+  }
+  const candidates = []
+  const envDir = String(process.env.DSH_EDGE_USER_DATA_DIR ?? '').trim()
+  if (envDir.length > 0) {
+    candidates.push({ browser: 'Microsoft Edge', file: path.join(envDir, 'DevToolsActivePort') })
+  }
+  if (process.platform === 'win32') {
+    const localAppData = process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local')
+    candidates.push(
+      { browser: 'Microsoft Edge', file: path.join(localAppData, 'Microsoft', 'Edge', 'User Data', 'DevToolsActivePort') },
+      { browser: 'Microsoft Edge Beta', file: path.join(localAppData, 'Microsoft', 'Edge Beta', 'User Data', 'DevToolsActivePort') },
+      { browser: 'Microsoft Edge Dev', file: path.join(localAppData, 'Microsoft', 'Edge Dev', 'User Data', 'DevToolsActivePort') },
+      { browser: 'Google Chrome', file: path.join(localAppData, 'Google', 'Chrome', 'User Data', 'DevToolsActivePort') },
+    )
+  } else if (process.platform === 'darwin') {
+    const appSupport = path.join(os.homedir(), 'Library', 'Application Support')
+    candidates.push(
+      { browser: 'Microsoft Edge', file: path.join(appSupport, 'Microsoft Edge', 'DevToolsActivePort') },
+      { browser: 'Google Chrome', file: path.join(appSupport, 'Google', 'Chrome', 'DevToolsActivePort') },
+    )
+  } else {
+    const cfgDir = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config')
+    candidates.push(
+      { browser: 'Microsoft Edge', file: path.join(cfgDir, 'microsoft-edge', 'DevToolsActivePort') },
+      { browser: 'Google Chrome', file: path.join(cfgDir, 'google-chrome', 'DevToolsActivePort') },
+    )
+  }
+  return candidates
+}
+
+function parseDevToolsActivePort(filePath) {
+  try {
+    const raw = fs.readFileSync(filePath, 'utf8')
+    const lines = raw.trim().split(/\r?\n/).map((line) => line.trim()).filter((line) => line.length > 0)
+    if (lines.length === 0) return null
+    const port = Number(lines[0])
+    if (!Number.isInteger(port) || port < 1 || port > 65535) return null
+    const wsPathRaw = lines[1] ?? '/devtools/browser'
+    const wsPath = wsPathRaw.startsWith('/') ? wsPathRaw : `/${wsPathRaw}`
+    return { port, wsPath }
+  } catch {
+    return null
+  }
+}
+
+async function wsCdpSession(wsUrl, timeoutMs) {
+  if (typeof globalThis.WebSocket !== 'function') {
+    throw new Error('global WebSocket is unavailable in this Node runtime')
+  }
+  return await new Promise((resolve, reject) => {
+    let ws = null
+    try {
+      ws = new globalThis.WebSocket(wsUrl)
+    } catch (error) {
+      reject(error)
+      return
+    }
+    const pending = new Map()
+    let nextId = 1
+    let settled = false
+    let closed = false
+
+    const failPending = (err) => {
+      for (const entry of pending.values()) entry.reject(err)
+      pending.clear()
+    }
+    const timer = setTimeout(() => {
+      const err = new Error('DevTools WebSocket timed out')
+      failPending(err)
+      try { ws.close() } catch { /* ignore */ }
+      if (!settled) { settled = true; reject(err) }
+    }, timeoutMs)
+    timer.unref?.()
+
+    ws.addEventListener('open', () => {
+      if (settled) return
+      settled = true
+      resolve({
+        send(method, params = {}) {
+          if (closed) return Promise.reject(new Error('DevTools WebSocket closed'))
+          const id = nextId++
+          return new Promise((res, rej) => {
+            pending.set(id, { resolve: res, reject: rej })
+            try {
+              ws.send(JSON.stringify({ id, method, params }))
+            } catch (error) {
+              pending.delete(id)
+              rej(error)
+            }
+          })
+        },
+        close() {
+          closed = true
+          clearTimeout(timer)
+          failPending(new Error('DevTools WebSocket closed'))
+          try { ws.close() } catch { /* ignore */ }
+        },
+      })
+    })
+
+    ws.addEventListener('message', (event) => {
+      const raw = typeof event?.data === 'string'
+        ? event.data
+        : Buffer.isBuffer(event?.data)
+          ? event.data.toString('utf8')
+          : String(event?.data ?? '')
+      let message = null
+      try { message = JSON.parse(raw) } catch { return }
+      if (message?.id === undefined) return
+      const entry = pending.get(message.id)
+      if (entry === undefined) return
+      pending.delete(message.id)
+      if (message.error !== undefined) entry.reject(new Error(`${message.error.message} (${message.error.code})`))
+      else entry.resolve(message.result)
+    })
+
+    ws.addEventListener('error', (event) => {
+      const err = new Error(event?.message ?? 'DevTools WebSocket connection error')
+      failPending(err)
+      clearTimeout(timer)
+      if (!settled) { settled = true; reject(err) }
+    })
+
+    ws.addEventListener('close', () => {
+      closed = true
+      clearTimeout(timer)
+      const err = new Error('DevTools WebSocket closed')
+      failPending(err)
+      if (!settled) { settled = true; reject(err) }
+    })
+  })
+}
+
+async function readLiveBrowserCookies(domains, { timeoutMs = 4_500, config } = {}) {
+  const candidates = devToolsPortCandidates(config)
+  const parsedCandidates = []
+  for (const candidate of candidates) {
+    const parsed = parseDevToolsActivePort(candidate.file)
+    if (parsed !== null) parsedCandidates.push({ ...candidate, ...parsed })
+  }
+  if (parsedCandidates.length === 0) return { status: 'no-port-file' }
+
+  let emptyMatch = null
+  let lastError = null
+  for (const candidate of parsedCandidates) {
+    let client = null
+    try {
+      client = await wsCdpSession(`ws://127.0.0.1:${candidate.port}${candidate.wsPath}`, timeoutMs)
+      const allCookies = []
+      const defaultRes = await client.send('Storage.getCookies', {})
+      if (Array.isArray(defaultRes?.cookies)) allCookies.push(...defaultRes.cookies)
+      try {
+        const targetsRes = await client.send('Target.getTargets', {})
+        const contextIds = new Set()
+        for (const info of targetsRes?.targetInfos ?? []) {
+          if (typeof info?.browserContextId === 'string' && info.browserContextId.length > 0) {
+            contextIds.add(info.browserContextId)
+          }
+        }
+        for (const browserContextId of contextIds) {
+          try {
+            const ctxRes = await client.send('Storage.getCookies', { browserContextId })
+            if (Array.isArray(ctxRes?.cookies)) allCookies.push(...ctxRes.cookies)
+          } catch { /* ignore individual browser context failure */ }
+        }
+      } catch { /* Target.getTargets optional */ }
+      const cookies = pickConsoleCookies(allCookies, domains)
+      if (cookies.length > 0) return { status: 'ok', browser: candidate.browser, cookies }
+      if (emptyMatch === null) emptyMatch = { status: 'ok', browser: candidate.browser, cookies: [] }
+    } catch (error) {
+      lastError = String(error?.message ?? error)
+    } finally {
+      try { client?.close() } catch { /* ignore */ }
+    }
+  }
+  if (emptyMatch !== null) return emptyMatch
+  return { status: 'connect-failed', error: lastError ?? 'connection failed' }
 }
 
 /** Minimal CDP client over `--remote-debugging-pipe`. */
@@ -586,7 +978,7 @@ function createPipeClient(child) {
   }
 }
 
-async function openBrowserPage({ headless, profileDir, url }) {
+async function openBrowserPage({ headless, profileDir, url, seedCookies = [] }) {
   const browserPath = findBrowser()
   if (browserPath === null) {
     throw httpError(500, 'no Chromium browser found — install Chrome or Edge, or set DSH_QUOTA_BROWSER to its executable')
@@ -598,23 +990,41 @@ async function openBrowserPage({ headless, profileDir, url }) {
     '--no-first-run',
     '--no-default-browser-check',
     '--disable-features=Translate,MediaRouter',
-    '--disable-background-networking',
     '--disable-sync',
     '--disable-extensions',
     '--disable-popup-blocking',
-    ...(headless ? ['--headless=new'] : ['--window-size=1180,880', '--new-window']),
+    ...(headless
+      ? [
+          '--headless=new',
+          '--disable-background-timer-throttling',
+          '--disable-renderer-backgrounding',
+          '--disable-backgrounding-occluded-windows',
+        ]
+      : ['--window-size=1180,880', '--new-window']),
     'about:blank',
   ], { stdio: ['ignore', 'ignore', 'ignore', 'pipe', 'pipe'], windowsHide: false })
 
+  let cdp = null
   const stop = () => {
-    try { child.kill() } catch { /* already gone */ }
+    // A polite Browser.close lets Chromium flush its cookie store to disk;
+    // fall back to kill if the process does not exit quickly.
+    try { cdp?.send('Browser.close').catch(() => {}) } catch { /* pipe already dead */ }
+    const killer = setTimeout(() => { try { child.kill() } catch { /* already gone */ } }, 3_000)
+    killer.unref?.()
+    child.once('exit', () => clearTimeout(killer))
   }
   try {
-    const cdp = createPipeClient(child)
+    cdp = createPipeClient(child)
     const { targetId } = await cdp.send('Target.createTarget', { url: 'about:blank' })
     const { sessionId } = await cdp.send('Target.attachToTarget', { targetId, flatten: true })
     await cdp.send('Page.enable', {}, sessionId)
     await cdp.send('Network.enable', {}, sessionId)
+    const sanitized = slimCookies(seedCookies)
+    if (sanitized.length > 0) {
+      // Resurrect the session cookies Chromium dropped on exit, before the
+      // console page's first request goes out.
+      try { await cdp.send('Network.setCookies', { cookies: sanitized }, sessionId) } catch { /* best effort */ }
+    }
     await cdp.send('Page.navigate', { url }, sessionId)
     return { cdp, sessionId, stop, browserPath }
   } catch (error) {
@@ -921,6 +1331,200 @@ async function queryMimo(cookie) {
   return parseMimoRaw(usage.data, detail?.data)
 }
 
+// ── sub2api ───────────────────────────────────────────────────────────
+//
+// Wei-Shaw/sub2api gateways answer `GET {base}/v1/usage` (Bearer API key) in
+// one of four mutually exclusive shapes: a `subscription` object with daily /
+// weekly / monthly USD windows, a total `quota`, `rate_limits` entries with
+// reset times, or a plain wallet `balance` (optionally with a `daily_usage`
+// breakdown).
+
+function sub2apiUsageUrl(baseURL) {
+  const root = gatewayRootUrl(baseURL)
+  return root === null ? null : `${root}/v1/usage`
+}
+
+function sub2apiQuotaWindow(key, used, limit, resetsAt) {
+  const l = Number(limit)
+  if (!Number.isFinite(l) || l <= 0) return null
+  const u = Number(used)
+  return percentWindow(key, ((Number.isFinite(u) ? u : 0) / l) * 100, resetsAt)
+}
+
+function sub2apiWindows(data) {
+  if (data === null || typeof data !== 'object') return null
+  const unit = data.unit ?? data.currency ?? ''
+  const windows = []
+  const sub = data.subscription
+  if (sub !== null && typeof sub === 'object') {
+    windows.push(
+      sub2apiQuotaWindow('1d', sub.daily_usage_usd, sub.daily_limit_usd),
+      sub2apiQuotaWindow('7d', sub.weekly_usage_usd, sub.weekly_limit_usd),
+      sub2apiQuotaWindow('30d', sub.monthly_usage_usd, sub.monthly_limit_usd),
+    )
+  }
+  const quota = data.quota
+  if (quota !== null && typeof quota === 'object') {
+    windows.push(sub2apiQuotaWindow('quota', quota.used, quota.limit))
+  }
+  if (Array.isArray(data.rate_limits)) {
+    for (const [index, rl] of data.rate_limits.entries()) {
+      if (rl === null || typeof rl !== 'object') continue
+      const key = String(rl.window ?? rl.name ?? `rate${index}`)
+      windows.push(sub2apiQuotaWindow(key, rl.used, rl.limit, rl.reset_at ?? rl.resets_at))
+    }
+  }
+  const balance = Number(data.balance ?? data.wallet?.balance)
+  if (Number.isFinite(balance)) windows.push(moneyWindow('balance', balance, unit))
+  if (Array.isArray(data.daily_usage)) {
+    const today = new Date().toISOString().slice(0, 10)
+    const row = data.daily_usage.find((r) => String(r?.date ?? '') === today)
+    const spend = Number(row?.actual_cost ?? row?.cost)
+    if (Number.isFinite(spend)) windows.push(textWindow('today', String(moneyText(spend, unit) ?? spend)))
+  }
+  if (typeof data.planName === 'string' && data.planName.trim().length > 0) {
+    windows.push(textWindow('plan', data.planName))
+  }
+  const kept = windows.filter((window) => window !== null)
+  return kept.length > 0 ? kept : null
+}
+
+async function querySub2api(key, baseURL) {
+  const url = sub2apiUsageUrl(baseURL)
+  if (url === null) throw httpError(502, 'sub2api provider has no baseURL configured')
+  const { status, ok, data } = await fetchJson(url, {
+    headers: { authorization: `Bearer ${key}`, accept: 'application/json', 'user-agent': BROWSER_UA },
+  })
+  if (status === 401 || status === 403) throw httpError(502, `sub2api rejected the API key (HTTP ${status})`)
+  if (!ok) throw httpError(502, `sub2api usage endpoint failed (HTTP ${status || 'network'})`)
+  const windows = sub2apiWindows(data)
+  if (windows === null) throw httpError(502, 'sub2api usage response has no usable windows')
+  return windows
+}
+
+// ── new-api / one-api ─────────────────────────────────────────────────
+//
+// QuantumNous/new-api and songquanpeng/one-api gateways expose:
+//   GET /api/status                         -> { data: { quota_per_unit } }
+//   GET /api/usage/token/                   -> { data: { object: "token_usage", total_granted, total_used, total_available, unlimited_quota, expires_at } }
+//   GET /v1/dashboard/billing/subscription  -> { object: "billing_subscription", hard_limit_usd, soft_limit_usd }
+//   GET /v1/dashboard/billing/usage         -> { total_usage (in cents) }
+
+const NEW_API_DEFAULT_QUOTA_PER_UNIT = 500_000
+const NEW_API_STATUS_TTL_MS = 10 * 60_000
+
+function newApiBillingDateRange() {
+  const now = Date.now()
+  const start = new Date(now - 99 * 86_400_000).toISOString().slice(0, 10)
+  const end = new Date(now + 86_400_000).toISOString().slice(0, 10)
+  return { startDate: start, endDate: end }
+}
+
+function parseNewApiWindows({ tokenPayload, subPayload, usagePayload, quotaPerUnit = NEW_API_DEFAULT_QUOTA_PER_UNIT }) {
+  const rate = Number.isFinite(Number(quotaPerUnit)) && Number(quotaPerUnit) > 0
+    ? Number(quotaPerUnit)
+    : NEW_API_DEFAULT_QUOTA_PER_UNIT
+  const tokenData = tokenPayload?.data && typeof tokenPayload.data === 'object'
+    ? tokenPayload.data
+    : (tokenPayload && tokenPayload.object === 'token_usage' ? tokenPayload : null)
+  const subData = subPayload && typeof subPayload === 'object' ? subPayload : null
+  const windows = []
+
+  if (tokenData?.object === 'token_usage' && tokenData.unlimited_quota === false && Number(tokenData.total_granted) > 0) {
+    const granted = Number(tokenData.total_granted)
+    const used = Number.isFinite(Number(tokenData.total_used)) ? Number(tokenData.total_used) : 0
+    const avail = Number.isFinite(Number(tokenData.total_available))
+      ? Number(tokenData.total_available)
+      : Math.max(0, granted - used)
+    const expiresAt = Number(tokenData.expires_at) > 0 ? Number(tokenData.expires_at) : null
+    const quotaWin = percentWindow('quota', (used / granted) * 100, expiresAt)
+    if (quotaWin !== null) windows.push(quotaWin)
+    const balWin = moneyWindow('balance', Math.max(0, avail) / rate, 'USD')
+    if (balWin !== null) windows.push(balWin)
+  } else if (subData !== null && (subData.object === 'billing_subscription' || Number.isFinite(Number(subData.hard_limit_usd)))) {
+    const limitUsd = Number(subData.hard_limit_usd ?? subData.soft_limit_usd)
+    const usedUsd = Number.isFinite(Number(usagePayload?.total_usage))
+      ? Number(usagePayload.total_usage) / 100
+      : Number.isFinite(Number(tokenData?.total_used))
+        ? Number(tokenData.total_used) / rate
+        : 0
+    if (Number.isFinite(limitUsd) && limitUsd > 0 && limitUsd < 10_000_000) {
+      const remainUsd = Math.max(0, limitUsd - usedUsd)
+      const balWin = moneyWindow('balance', remainUsd, 'USD')
+      if (balWin !== null) windows.push(balWin)
+    } else {
+      const infWin = textWindow('balance', '∞')
+      if (infWin !== null) windows.push(infWin)
+    }
+    if (usedUsd > 0) {
+      const usedWin = moneyWindow('used', usedUsd, 'USD')
+      if (usedWin !== null) windows.push(usedWin)
+    }
+  } else if (tokenData?.object === 'token_usage' && tokenData.unlimited_quota === true) {
+    const infWin = textWindow('balance', '∞')
+    if (infWin !== null) windows.push(infWin)
+    const usedUsd = Number.isFinite(Number(tokenData.total_used)) ? Number(tokenData.total_used) / rate : 0
+    if (usedUsd > 0) {
+      const usedWin = moneyWindow('used', usedUsd, 'USD')
+      if (usedWin !== null) windows.push(usedWin)
+    }
+  }
+
+  return windows.length > 0 ? windows : null
+}
+
+async function fetchNewApiQuotaPerUnit(root, statusCache) {
+  const hit = statusCache?.get(root)
+  if (hit !== undefined && Date.now() - hit.at < NEW_API_STATUS_TTL_MS) return hit.quotaPerUnit
+  let quotaPerUnit = NEW_API_DEFAULT_QUOTA_PER_UNIT
+  try {
+    const { ok, data } = await fetchJson(`${root}/api/status`, {
+      headers: { accept: 'application/json', 'user-agent': BROWSER_UA },
+      timeoutMs: 5_000,
+      attempts: 1,
+    })
+    const candidate = Number(data?.data?.quota_per_unit)
+    if (ok && Number.isFinite(candidate) && candidate > 0) quotaPerUnit = candidate
+  } catch { /* fall back to default conversion rate */ }
+  statusCache?.set(root, { quotaPerUnit, at: Date.now() })
+  return quotaPerUnit
+}
+
+async function fetchNewApiTokenUsage(root, headers) {
+  const first = await fetchJson(`${root}/api/usage/token/`, { headers }).catch(() => ({ status: 0, ok: false, data: null }))
+  if (first.status !== 404) return first
+  return fetchJson(`${root}/api/usage/token`, { headers }).catch(() => ({ status: 0, ok: false, data: null }))
+}
+
+async function queryNewApi(key, baseURL, statusCache) {
+  const root = gatewayRootUrl(baseURL)
+  if (root === null) throw httpError(502, 'New API provider has no baseURL configured')
+  const headers = { authorization: `Bearer ${key}`, accept: 'application/json', 'user-agent': BROWSER_UA }
+  const { startDate, endDate } = newApiBillingDateRange()
+  const [quotaPerUnit, tokenRes, subRes, usageRes] = await Promise.all([
+    fetchNewApiQuotaPerUnit(root, statusCache),
+    fetchNewApiTokenUsage(root, headers),
+    fetchJson(`${root}/v1/dashboard/billing/subscription`, { headers }).catch(() => ({ status: 0, ok: false, data: null })),
+    fetchJson(`${root}/v1/dashboard/billing/usage?start_date=${startDate}&end_date=${endDate}`, { headers }).catch(() => ({ status: 0, ok: false, data: null })),
+  ])
+  const windows = parseNewApiWindows({
+    tokenPayload: tokenRes.ok ? tokenRes.data : null,
+    subPayload: subRes.ok ? subRes.data : null,
+    usagePayload: usageRes.ok ? usageRes.data : null,
+    quotaPerUnit,
+  })
+  if (windows !== null) return windows
+  const authFailed = [tokenRes, subRes].find((res) => (res.status === 401 || res.status === 403))
+  if (authFailed !== undefined && !tokenRes.ok && !subRes.ok) {
+    throw httpError(502, `New API rejected the API key (HTTP ${authFailed.status})`)
+  }
+  const errStatus = [tokenRes, subRes].find((res) => !res.ok && res.status > 0)?.status ?? 0
+  if (!tokenRes.ok && !subRes.ok) {
+    throw httpError(502, `New API usage endpoint failed (HTTP ${errStatus || 'network'})`)
+  }
+  throw httpError(502, 'New API usage response has no usable windows')
+}
+
 /** The open platform origin whose `/user/balance` bills this API key. */
 function deepseekOfficialOrigin(route = {}) {
   const configured = String(route.baseURL ?? process.env.DEEPSEEK_BASE_URL ?? '').trim()
@@ -973,8 +1577,39 @@ function accountClientMetadata(ctx) {
 // ── plugin ────────────────────────────────────────────────────────────
 
 export function apply(ctx, config = {}) {
+  const dataDir = meterDataDir(config)
   const cache = new Map()
   const inflight = new Map()
+  const newApiStatusCache = new Map()
+  const gatewayProbed = new Map()
+  const headlessRefreshInflight = new Map()
+  const edgeSyncInflight = new Map()
+  const autoRecoverFailedAt = new Map()
+  const runtimeConsoleCookies = new Map()
+
+  const GATEWAY_POS_TTL_MS = 30 * 60_000
+  const GATEWAY_NEG_TTL_MS = 5 * 60_000
+
+  function cachedGatewayProbe(baseURL) {
+    const entry = gatewayProbed.get(baseURL)
+    if (entry === undefined) return undefined
+    const ttl = entry.family === null ? GATEWAY_NEG_TTL_MS : GATEWAY_POS_TTL_MS
+    if (Date.now() - entry.at >= ttl) {
+      gatewayProbed.delete(baseURL)
+      return undefined
+    }
+    return entry.family
+  }
+
+  async function saveConsoleCookie(family, cookie, cookiesList = null) {
+    await storeConsoleCookie(ctx.get('credentials'), family, cookie)
+    runtimeConsoleCookies.set(family, cookie)
+    const dir = profileDirFor(family, dataDir)
+    persistJarCookies(dir, cookiesList ?? headerCookiesFor(family, cookie))
+    markProfileBound(dir)
+    autoRecoverFailedAt.delete(family)
+    cache.clear()
+  }
 
   // ── parked console browsers ─────────────────────────────────────────
   //
@@ -996,7 +1631,7 @@ export function apply(ctx, config = {}) {
   }
 
   /** Re-read the parked browser's jar and refresh the stored cookie when it moved. */
-  async function keepAliveTick(family, entry, { force = false } = {}) {
+  async function keepAliveTick(family, entry, { force = false, countFailure = true } = {}) {
     if (entry.stopped) return false
     try {
       const result = await entry.page.cdp.send('Storage.getCookies', {}, entry.page.sessionId)
@@ -1007,8 +1642,7 @@ export function apply(ctx, config = {}) {
       entry.lastHeader = header
       try {
         await queryUncached(family, header)
-        await storeConsoleCookie(ctx.get('credentials'), family, header)
-        markProfileBound(profileDirFor(family))
+        await saveConsoleCookie(family, header, cookies)
         entry.ok = true
         entry.lastError = null
         entry.failures = 0
@@ -1016,9 +1650,11 @@ export function apply(ctx, config = {}) {
       } catch (error) {
         entry.ok = false
         entry.lastError = String(error?.message ?? error)
-        entry.failures = (entry.failures ?? 0) + 1
-        // A parked browser that stays signed out is just a wasted process.
-        if (entry.failures >= 3) stopKeepAlive(family).catch(() => {})
+        if (countFailure && Date.now() - (entry.startedAt ?? 0) > 15_000) {
+          entry.failures = (entry.failures ?? 0) + 1
+          // A parked browser that stays signed out is just a wasted process.
+          if (entry.failures >= 3) stopKeepAlive(family).catch(() => {})
+        }
         return false
       }
     } catch (error) {
@@ -1027,34 +1663,367 @@ export function apply(ctx, config = {}) {
     }
   }
 
-  async function startKeepAlive(family) {
+  async function startKeepAlive(family, { extraSeedCookies = [], allowUnbound = false } = {}) {
     if (KEEPALIVE.has(family)) return
     const target = LOGIN_TARGETS[family]
     if (target === undefined) return
-    const profileDir = profileDirFor(family)
-    if (!profileLooksBound(profileDir)) return
+    const profileDir = profileDirFor(family, dataDir)
+    if (!allowUnbound && !profileLooksBound(profileDir)) return
+    const baseCookies = resurrectCookiesFor(family, profileDir, await secretFor(family, {}))
+    const seedCookies = extraSeedCookies.length > 0
+      ? mergeCookieLists(baseCookies, extraSeedCookies)
+      : baseCookies
     let page = null
     try {
-      page = await openBrowserPage({ headless: true, profileDir, url: target.loginUrl })
+      page = await openBrowserPage({ headless: true, profileDir, url: target.loginUrl, seedCookies })
     } catch {
       return
     }
-    const entry = { family, page, timer: null, lastHeader: '', lastError: null, ok: false, stopped: false, failures: 0 }
+    const entry = {
+      family,
+      page,
+      timer: null,
+      lastHeader: '',
+      lastError: null,
+      ok: false,
+      stopped: false,
+      failures: 0,
+      startedAt: Date.now(),
+    }
     KEEPALIVE.set(family, entry)
-    await keepAliveTick(family, entry, { force: true })
+    await keepAliveTick(family, entry, { force: true, countFailure: false })
+    // The parked page may still be mid-SSO; check once more shortly after
+    // startup instead of waiting a whole interval.
+    const warmup = setTimeout(() => {
+      keepAliveTick(family, entry, { force: true, countFailure: false }).catch(() => {})
+    }, KEEPALIVE_FIRST_TICK_MS)
+    warmup.unref?.()
     entry.timer = setInterval(() => { keepAliveTick(family, entry).catch(() => {}) }, KEEPALIVE_MS)
     entry.timer.unref?.()
+  }
+
+  async function refreshViaHeadless(family, extraSeedCookies = []) {
+    const running = headlessRefreshInflight.get(family)
+    if (running !== undefined) return running
+    const promise = (async () => {
+      const profileDir = profileDirFor(family, dataDir)
+      if (extraSeedCookies.length > 0) await stopKeepAlive(family)
+      if (!KEEPALIVE.has(family)) {
+        await startKeepAlive(family, { extraSeedCookies, allowUnbound: extraSeedCookies.length > 0 })
+      }
+      const entry = KEEPALIVE.get(family)
+      if (entry === undefined) return false
+      if (entry.ok === true) return true
+      const maxWait = Number.isFinite(Number(config.headlessRefreshMs))
+        ? Math.max(200, Number(config.headlessRefreshMs))
+        : 15_000
+      const deadline = Date.now() + maxWait
+      while (Date.now() < deadline && !entry.stopped) {
+        const waitMs = Math.min(1_500, Math.max(50, deadline - Date.now()))
+        await new Promise((resolve) => setTimeout(resolve, waitMs))
+        const ok = await keepAliveTick(family, entry, { force: true, countFailure: false })
+        if (ok) return true
+      }
+      if (!profileLooksBound(profileDir)) stopKeepAlive(family).catch(() => {})
+      return entry.ok === true
+    })().finally(() => {
+      headlessRefreshInflight.delete(family)
+    })
+    headlessRefreshInflight.set(family, promise)
+    return promise
+  }
+
+  async function syncConsoleFromEdge(family, { interactive = false } = {}) {
+    const target = LOGIN_TARGETS[family]
+    if (target === undefined) return { status: 'error', message: `unknown console family "${family}"` }
+    const running = edgeSyncInflight.get(family)
+    if (running !== undefined) return running
+    const promise = (async () => {
+      const live = await readLiveBrowserCookies(target.domains, {
+        timeoutMs: interactive ? 25_000 : 4_500,
+        config,
+      })
+      if (live.status === 'no-port-file') {
+        return {
+          status: 'no-port-file',
+          message: '未检测到开启远程调试的 Edge 实例。请先在 Edge 地址栏打开 edge://inspect/#remote-debugging 并开启远程调试（首次弹窗点击允许即可）。',
+        }
+      }
+      if (live.status === 'connect-failed') {
+        return {
+          status: 'connect-failed',
+          message: `检测到 Edge 调试端口但无法连接（${live.error ?? 'connection refused'}）。请在 Edge 弹窗中点击“允许”，或打开 edge://inspect/#remote-debugging 确认已开启。`,
+        }
+      }
+      if (live.cookies.length === 0) {
+        return {
+          status: 'no-cookies',
+          browser: live.browser,
+          message: `在 ${live.browser} 中未找到 ${target.label} 的登录 Cookie，请先在 Edge 中打开控制台并登录。`,
+        }
+      }
+      const header = cookieHeaderOf(live.cookies)
+      const directUsable = family !== 'mimo' || mimoCookieUsable(header)
+      if (directUsable) {
+        try {
+          await queryUncached(family, header)
+          await saveConsoleCookie(family, header, live.cookies)
+          if (config.disableAutoKeepAlive !== true) startKeepAlive(family).catch(() => {})
+          return { status: 'ok', browser: live.browser, via: 'direct', cookieCount: live.cookies.length }
+        } catch {
+          // Fall through to headless SSO token refresh with Edge's cookies.
+        }
+      }
+      if (config.disableAutoKeepAlive !== true) {
+        const refreshed = await refreshViaHeadless(family, live.cookies)
+        if (refreshed) {
+          cache.clear()
+          return { status: 'ok', browser: live.browser, via: 'headless-sso', cookieCount: live.cookies.length }
+        }
+      }
+      return {
+        status: 'error',
+        browser: live.browser,
+        message: `已从 ${live.browser} 读到 ${live.cookies.length} 条 Cookie，但控制台校验失败（登录可能已过期，请在 Edge 中刷新或重新登录控制台后再试）。`,
+      }
+    })().finally(() => {
+      edgeSyncInflight.delete(family)
+    })
+    edgeSyncInflight.set(family, promise)
+    return promise
+  }
+
+  async function recoverConsoleSession(family) {
+    const lastFail = autoRecoverFailedAt.get(family) ?? 0
+    if (Date.now() - lastFail < 30_000) return false
+    const edgeRes = await syncConsoleFromEdge(family, { interactive: false }).catch(() => null)
+    if (edgeRes?.status === 'ok') return true
+    if (profileLooksBound(profileDirFor(family, dataDir)) && config.disableAutoKeepAlive !== true) {
+      const refreshed = await refreshViaHeadless(family).catch(() => false)
+      if (refreshed) return true
+    }
+    autoRecoverFailedAt.set(family, Date.now())
+    return false
+  }
+
+  /** Match config.sub2apiProviders / config.newApiProviders allowlists. */
+  function declaredInConfig(provider, row, rawList) {
+    const raw = rawList ?? []
+    const list = (Array.isArray(raw) ? raw : String(raw).split(/[,\s]+/))
+      .map((item) => String(item).trim().toLowerCase())
+      .filter((item) => item.length > 0)
+    const ns = String(provider ?? '').toLowerCase()
+    const url = String(row?.baseURL ?? '').toLowerCase()
+    return list.some((item) => ns === item || (url.length > 0 && url.includes(item)))
+  }
+
+  function gatewayAssignment(provider, row) {
+    const persisted = loadGatewayMap(dataDir)
+    const ns = String(provider ?? '').trim()
+    if (ns.length > 0) {
+      if (persisted[ns] !== undefined) {
+        const value = persisted[ns]
+        return { value, source: value === 'none' ? 'suppressed' : 'manual' }
+      }
+      const lower = ns.toLowerCase()
+      for (const [key, value] of Object.entries(persisted)) {
+        if (key.toLowerCase() === lower) {
+          return { value, source: value === 'none' ? 'suppressed' : 'manual' }
+        }
+      }
+    }
+    if (declaredInConfig(provider, row, config.newApiProviders)) return { value: 'new-api', source: 'manual' }
+    if (declaredInConfig(provider, row, config.sub2apiProviders)) return { value: 'sub2api', source: 'manual' }
+    return null
   }
 
   function familyContext(provider) {
     const rows = readProviderRows(ctx)
     const row = rows[provider] ?? {}
-    const family = detectFamily(provider, row.baseURL)
-    if (family === null) return null
-    return { family, row }
+    const assigned = gatewayAssignment(provider, row)
+    if (assigned !== null && assigned.value !== 'none') {
+      return { family: assigned.value, row, source: 'manual' }
+    }
+    const suppressed = assigned?.value === 'none'
+    let detected = detectFamily(provider, row.baseURL)
+    if (suppressed && (detected === 'sub2api' || detected === 'new-api')) {
+      detected = null
+    }
+    if (detected !== null) {
+      return { family: detected, row, source: 'url' }
+    }
+    if (!suppressed) {
+      const probed = cachedGatewayProbe(String(row.baseURL ?? '').trim())
+      if (typeof probed === 'string') return { family: probed, row, source: 'auto' }
+    }
+    return null
   }
 
-  async function secretFor(family, row) {
+  async function providerOwnSecret(provider, row) {
+    const candidates = []
+    if (typeof row?.apiKeyEnv === 'string' && row.apiKeyEnv.trim().length > 0) {
+      candidates.push(row.apiKeyEnv.trim())
+    }
+    const conv = conventionalEnvName(provider)
+    if (conv.length > 0 && !candidates.includes(conv)) candidates.push(conv)
+    const direct = await resolveCredential(ctx, candidates)
+    if (direct !== null) return direct
+    if (typeof row?.apiKey === 'string') {
+      const rawKey = row.apiKey.trim()
+      if (rawKey.length > 0) {
+        const resolved = await resolveCredential(ctx, [rawKey])
+        if (resolved !== null) return resolved
+        if (rawKey.startsWith('sk-')) return rawKey
+      }
+    }
+    return null
+  }
+
+  /**
+   * Self-hosted Sub2API / New API deployments rarely carry their product name in
+   * the URL. Probe lightweight status/usage endpoints once with the provider's
+   * own key to classify the gateway automatically.
+   */
+  async function probeGatewayProvider(provider, { force = false } = {}) {
+    const row = readProviderRows(ctx)[provider] ?? {}
+    const baseURL = String(row.baseURL ?? '').trim()
+    const root = gatewayRootUrl(baseURL)
+    if (root === null || isOfficialFirstPartyUrl(baseURL)) return null
+    if (!force) {
+      const cached = cachedGatewayProbe(baseURL)
+      if (cached === null) return null
+      if (typeof cached === 'string') return { family: cached, row }
+    }
+
+    const secret = await providerOwnSecret(provider, row)
+    const headers = secret !== null
+      ? { authorization: `Bearer ${secret}`, accept: 'application/json', 'user-agent': BROWSER_UA }
+      : null
+    const subUrl = sub2apiUsageUrl(baseURL)
+
+    const [statusRes, subRes] = await Promise.all([
+      fetchJson(`${root}/api/status`, {
+        headers: { accept: 'application/json', 'user-agent': BROWSER_UA },
+        timeoutMs: 5_000,
+        attempts: 1,
+      }).catch(() => ({ status: 0, ok: false, data: null })),
+      headers !== null && subUrl !== null
+        ? fetchJson(subUrl, { headers, timeoutMs: 5_000, attempts: 1 }).catch(() => ({ status: 0, ok: false, data: null }))
+        : Promise.resolve({ status: 0, ok: false, data: null }),
+    ])
+
+    const statusData = statusRes?.ok === true ? statusRes.data?.data : null
+    if (
+      statusRes?.ok === true
+      && statusRes.data?.success === true
+      && statusData !== null
+      && typeof statusData === 'object'
+      && (typeof statusData.quota_per_unit === 'number' || typeof statusData.display_in_currency === 'boolean')
+    ) {
+      const rate = Number(statusData.quota_per_unit)
+      if (Number.isFinite(rate) && rate > 0) newApiStatusCache.set(root, { quotaPerUnit: rate, at: Date.now() })
+      gatewayProbed.set(baseURL, { family: 'new-api', at: Date.now() })
+      return { family: 'new-api', row }
+    }
+
+    const subData = subRes?.ok === true ? subRes.data : null
+    if (
+      subData !== null
+      && typeof subData === 'object'
+      && !Array.isArray(subData)
+      && (
+        subData.subscription !== undefined
+        || subData.quota !== undefined
+        || subData.rate_limits !== undefined
+        || subData.balance !== undefined
+        || subData.wallet !== undefined
+        || subData.daily_usage !== undefined
+        || subData.planName !== undefined
+      )
+      && sub2apiWindows(subData) !== null
+    ) {
+      gatewayProbed.set(baseURL, { family: 'sub2api', at: Date.now() })
+      return { family: 'sub2api', row }
+    }
+
+    let tokenRes = { status: 0, ok: false, data: null }
+    let billingRes = { status: 0, ok: false, data: null }
+    if (headers !== null) {
+      ;[tokenRes, billingRes] = await Promise.all([
+        fetchJson(`${root}/api/usage/token/`, { headers, timeoutMs: 5_000, attempts: 1 }).catch(() => ({ status: 0, ok: false, data: null })),
+        fetchJson(`${root}/v1/dashboard/billing/subscription`, { headers, timeoutMs: 5_000, attempts: 1 }).catch(() => ({ status: 0, ok: false, data: null })),
+      ])
+      if (
+        (tokenRes.ok === true && tokenRes.data?.data?.object === 'token_usage')
+        || (billingRes.ok === true && billingRes.data?.object === 'billing_subscription' && Number.isFinite(Number(billingRes.data?.hard_limit_usd)))
+      ) {
+        gatewayProbed.set(baseURL, { family: 'new-api', at: Date.now() })
+        return { family: 'new-api', row }
+      }
+    }
+
+    const anyHttpReply = [statusRes, subRes, tokenRes, billingRes].some((res) => (res?.status ?? 0) > 0)
+    if (anyHttpReply && secret !== null) {
+      gatewayProbed.set(baseURL, { family: null, at: Date.now() })
+    }
+    return null
+  }
+
+  async function buildProviderInventory({ probe = false, force = false } = {}) {
+    const rows = readProviderRows(ctx)
+    const entries = Object.entries(rows)
+    if (probe) {
+      await Promise.all(entries.map(async ([id, rawRow]) => {
+        const row = rawRow !== null && typeof rawRow === 'object' ? rawRow : {}
+        const baseURL = String(row.baseURL ?? '').trim()
+        const assigned = gatewayAssignment(id, row)
+        if (assigned !== null) return
+        if (detectFamily(id, baseURL) !== null) return
+        if (gatewayRootUrl(baseURL) === null || isOfficialFirstPartyUrl(baseURL)) return
+        await probeGatewayProvider(id, { force }).catch(() => null)
+      }))
+    }
+    return entries.map(([id, rawRow]) => {
+      const row = rawRow !== null && typeof rawRow === 'object' ? rawRow : {}
+      const baseURL = String(row.baseURL ?? '').trim()
+      const assigned = gatewayAssignment(id, row)
+      const detected = detectFamily(id, baseURL)
+      const builtin = detected !== null
+        && detected !== 'sub2api'
+        && detected !== 'new-api'
+        && (baseURL === '' || isOfficialFirstPartyUrl(baseURL))
+        && assigned === null
+
+      let family = null
+      let source = null
+      if (assigned !== null) {
+        if (assigned.value === 'none') {
+          if (detected !== null && detected !== 'sub2api' && detected !== 'new-api') {
+            family = detected
+            source = 'url'
+          } else {
+            family = null
+            source = 'suppressed'
+          }
+        } else {
+          family = assigned.value
+          source = 'manual'
+        }
+      } else if (detected !== null) {
+        family = detected
+        source = 'url'
+      } else {
+        const probed = cachedGatewayProbe(baseURL)
+        if (typeof probed === 'string') {
+          family = probed
+          source = 'auto'
+        }
+      }
+      return { id, baseURL, family, source, builtin }
+    })
+  }
+
+  async function secretFor(family, row, provider = '') {
     // Console families are cookie-only: a provider API key would be rejected by
     // the console endpoint, so never let one stand in for the cookie.
     if (family === 'stepfun' || family === 'mimo') {
@@ -1062,23 +2031,28 @@ export function apply(ctx, config = {}) {
         ? String(config.stepfunCookie ?? '').trim()
         : String(config.mimoCookie ?? '').trim()
       if (configured.length > 0) return configured
-      return resolveCredential(ctx, FAMILY_KEY_ENVS[family] ?? [])
+      const resolved = await resolveCredential(ctx, FAMILY_KEY_ENVS[family] ?? [])
+      if (resolved !== null) return resolved
+      return runtimeConsoleCookies.get(family) ?? null
     }
     if (family === 'deepseek-official') {
       // The route's credential name is configurable on the llm-deepseek entry.
       const route = readDeepseekRoute(ctx)
       return resolveCredential(ctx, [route.apiKeyEnv, ...(FAMILY_KEY_ENVS[family] ?? [])])
     }
-    const envs = [...(row?.apiKeyEnv !== undefined ? [String(row.apiKeyEnv)] : []), ...(FAMILY_KEY_ENVS[family] ?? [])]
-    return resolveCredential(ctx, envs)
+    const own = await providerOwnSecret(provider, row)
+    if (own !== null) return own
+    return resolveCredential(ctx, FAMILY_KEY_ENVS[family] ?? [])
   }
 
-  async function queryUncached(family, secret) {
+  async function queryUncached(family, secret, row = {}) {
     if (family === 'minimax') return queryMinimax(secret)
     if (family === 'kimi') return queryKimi(secret)
     if (family === 'opencode-go') return queryOpenCodeGo(secret)
     if (family === 'stepfun') return queryStepfun(secret)
     if (family === 'mimo') return queryMimo(secret)
+    if (family === 'sub2api') return querySub2api(secret, row.baseURL)
+    if (family === 'new-api') return queryNewApi(secret, row.baseURL, newApiStatusCache)
     if (family === 'deepseek-official') return queryDeepSeekOfficial(secret, readDeepseekRoute(ctx))
     throw httpError(400, `unknown quota family "${family}"`)
   }
@@ -1151,15 +2125,26 @@ export function apply(ctx, config = {}) {
   }
 
   async function quotaFor(provider, model, familyOverride) {
+    const rows = readProviderRows(ctx)
+    const row = provider.length > 0 ? (rows[provider] ?? {}) : {}
     let family = familyOverride !== undefined && FAMILY_LABELS[familyOverride] !== undefined ? familyOverride : null
-    let row = {}
     if (family === null) {
       const context = familyContext(provider)
       if (context === null) {
-        return { status: 'unsupported', provider, message: `provider "${provider}" has no quota adapter`, windows: [] }
+        const assigned = gatewayAssignment(provider, row)
+        const probe = assigned?.value === 'none' ? null : await probeGatewayProvider(provider)
+        if (probe === null) {
+          return {
+            status: 'unsupported',
+            provider,
+            message: `provider "${provider}" has no quota adapter (assign it to Sub2API / New API in Settings → 内置插件 → 额度徽章 if applicable)`,
+            windows: [],
+          }
+        }
+        family = probe.family
+      } else {
+        family = context.family
       }
-      family = context.family
-      row = context.row
     }
     // Xiaomi MiMo models are often served through an OpenCode Go route; when a
     // MiMo console cookie is bound, report the MiMo plan limits for them instead.
@@ -1168,71 +2153,80 @@ export function apply(ctx, config = {}) {
       if (mimoSecret !== null && mimoCookieUsable(mimoSecret)) family = 'mimo'
     }
     if (family === 'deepseek-account') return quotaForDeepSeekAccount(provider)
-    const secret = await secretFor(family, row)
+
     const isConsole = family === 'stepfun' || family === 'mimo'
+    const providerLabel = (family === 'sub2api' || family === 'new-api') && provider.length > 0 && provider.toLowerCase() !== family
+      ? `${FAMILY_LABELS[family]} · ${provider}`
+      : FAMILY_LABELS[family]
+
+    let secret = await secretFor(family, row, provider)
+    if (isConsole && (secret === null || (family === 'mimo' && !mimoCookieUsable(secret)))) {
+      const recovered = await recoverConsoleSession(family)
+      if (recovered) secret = await secretFor(family, row, provider)
+    }
+
     if (secret === null) {
+      const keyHints = row?.apiKeyEnv
+        ? String(row.apiKeyEnv)
+        : (FAMILY_KEY_ENVS[family] ?? []).join(' / ')
       return {
-        status: isConsole ? 'no-credential' : 'no-credential',
+        status: 'no-credential',
+        expired: false,
         provider,
         family,
-        providerLabel: FAMILY_LABELS[family],
+        providerLabel,
         setupFamily: isConsole ? family : null,
         message: isConsole
           ? `${FAMILY_LABELS[family]} console cookie not configured — sign in from Settings → 内置插件 → 额度徽章, or click the badge`
-          : `no API key found for ${FAMILY_LABELS[family]} (set ${FAMILY_KEY_ENVS[family].join(' / ')})`,
+          : `no API key found for ${providerLabel} (set ${keyHints})`,
         windows: [],
       }
     }
     if (family === 'mimo' && !mimoCookieUsable(secret)) {
       return {
         status: 'no-credential',
+        expired: true,
         provider,
         family,
-        providerLabel: FAMILY_LABELS[family],
+        providerLabel,
         setupFamily: 'mimo',
-        message: 'MiMo cookie must contain serviceToken and userId — paste the full cookie header again',
+        message: 'MiMo cookie must contain serviceToken and userId — sync from Edge or paste the full cookie header again',
         windows: [],
       }
     }
-    const cacheKey = `${family}:${secret.slice(0, 10)}:${secret.length}:${model ?? ''}`
+    const cacheKey = `${family}:${row.baseURL ?? provider ?? ''}:${secret.slice(0, 10)}:${secret.length}:${model ?? ''}`
     const hit = cache.get(cacheKey)
-    if (hit !== undefined && Date.now() - hit.at < hit.ttl) return { ...hit.value, provider, family }
+    if (hit !== undefined && Date.now() - hit.at < hit.ttl) return { ...hit.value, provider, family, providerLabel }
     const running = inflight.get(cacheKey)
     if (running !== undefined) return running
     const promise = (async () => {
       try {
-        const windows = await queryUncached(family, secret)
-        const value = { status: 'ok', family, providerLabel: FAMILY_LABELS[family], fetchedAt: Date.now(), windows }
+        const windows = await queryUncached(family, secret, row)
+        const value = { status: 'ok', family, providerLabel, fetchedAt: Date.now(), windows }
         cache.set(cacheKey, { at: Date.now(), ttl: OK_TTL_MS, value })
         return { ...value, provider }
       } catch (error) {
         // A console that no longer accepts the saved session is a binding
-        // problem, not a query failure: ask for a fresh sign-in instead of
-        // showing a red "!" on the badge.
+        // problem, not a query failure: try silent recovery via Edge or parked
+        // headless browser before prompting the user.
         if (isConsole && error?.authExpired === true) {
-          // The parked browser refreshes the console's short-lived token; ask
-          // it for the current jar and retry once before asking a human.
-          if (!KEEPALIVE.has(family) && profileLooksBound(profileDirFor(family))) {
-            await startKeepAlive(family).catch(() => {})
-          }
-          const parked = KEEPALIVE.get(family)
-          if (parked !== undefined) {
-            const refreshed = await keepAliveTick(family, parked, { force: true })
-            if (refreshed) {
-              const fresh = await secretFor(family, {})
-              if (fresh !== null && fresh !== secret) {
-                try {
-                  const windows = await queryUncached(family, fresh)
-                  const value = { status: 'ok', family, providerLabel: FAMILY_LABELS[family], fetchedAt: Date.now(), windows }
-                  return { ...value, provider }
-                } catch { /* fall through to the re-bind prompt */ }
-              }
+          const recovered = await recoverConsoleSession(family)
+          if (recovered) {
+            const fresh = await secretFor(family, row, provider)
+            if (fresh !== null) {
+              try {
+                const windows = await queryUncached(family, fresh, row)
+                const value = { status: 'ok', family, providerLabel, fetchedAt: Date.now(), windows }
+                cache.set(cacheKey, { at: Date.now(), ttl: OK_TTL_MS, value })
+                return { ...value, provider }
+              } catch { /* fall through to the re-bind prompt */ }
             }
           }
           const value = {
             status: 'no-credential',
+            expired: true,
             family,
-            providerLabel: FAMILY_LABELS[family],
+            providerLabel,
             setupFamily: family,
             fetchedAt: Date.now(),
             message: error.message,
@@ -1244,7 +2238,7 @@ export function apply(ctx, config = {}) {
         const value = {
           status: 'error',
           family,
-          providerLabel: FAMILY_LABELS[family],
+          providerLabel,
           fetchedAt: Date.now(),
           message: error?.httpStatus !== undefined ? error.message : `quota query failed: ${error?.message ?? String(error)}`,
           windows: [],
@@ -1265,13 +2259,13 @@ export function apply(ctx, config = {}) {
    * Watch one browser's cookie jar until it passes the console check, then
    * store it. Returns true once bound.
    */
-  async function captureOnce(session, target, profileDir, { headless, deadline }) {
+  async function captureOnce(session, target, profileDir, { headless, deadline, seedCookies = [] }) {
     session.phase = headless ? 'checking' : 'waiting'
     session.message = headless ? '检查已保存的登录状态…' : '等待你在浏览器里登录…'
     session.updatedAt = Date.now()
     let page = null
     try {
-      page = await openBrowserPage({ headless, profileDir, url: target.loginUrl })
+      page = await openBrowserPage({ headless, profileDir, url: target.loginUrl, seedCookies })
     } catch (error) {
       session.lastError = String(error?.message ?? error)
       return false
@@ -1304,9 +2298,7 @@ export function apply(ctx, config = {}) {
         if (!headless) session.message = '正在校验控制台登录状态…'
         try {
           await queryUncached(session.family, candidate)
-          await storeConsoleCookie(ctx.get('credentials'), session.family, candidate)
-          cache.clear()
-          markProfileBound(profileDir)
+          await saveConsoleCookie(session.family, candidate, cookies)
           session.phase = 'bound'
           session.message = '已绑定 ✓'
           session.updatedAt = Date.now()
@@ -1328,11 +2320,12 @@ export function apply(ctx, config = {}) {
 
   async function runLoginSession(session) {
     const target = LOGIN_TARGETS[session.family]
-    const profileDir = profileDirFor(session.family)
+    const profileDir = profileDirFor(session.family, dataDir)
+    const seedCookies = resurrectCookiesFor(session.family, profileDir, await secretFor(session.family, {}).catch(() => null))
     try {
       // A profile that is still signed in binds silently, with no window.
       if (profileLooksBound(profileDir)) {
-        const quick = await captureOnce(session, target, profileDir, { headless: true, deadline: Date.now() + LOGIN_QUICK_MS })
+        const quick = await captureOnce(session, target, profileDir, { headless: true, deadline: Date.now() + LOGIN_QUICK_MS, seedCookies })
         if (quick) {
           if (session.parkAfterBind === true) startKeepAlive(session.family).catch(() => {})
           return
@@ -1342,7 +2335,7 @@ export function apply(ctx, config = {}) {
       session.phase = 'waiting'
       session.message = `请在打开的浏览器里登录 ${target.label}，登录后会自动绑定`
       session.updatedAt = Date.now()
-      const bound = await captureOnce(session, target, profileDir, { headless: false, deadline: Date.now() + LOGIN_TIMEOUT_MS })
+      const bound = await captureOnce(session, target, profileDir, { headless: false, deadline: Date.now() + LOGIN_TIMEOUT_MS, seedCookies })
       if (bound) {
         if (session.parkAfterBind === true) startKeepAlive(session.family).catch(() => {})
         return
@@ -1440,6 +2433,18 @@ document.getElementById('save').onclick = async () => {
     stopAllKeepAlive().catch(() => {})
   }, 'dsh-meter: browser login sessions')
 
+  if (config.disableAutoKeepAlive !== true) {
+    const bootTimer = setTimeout(() => {
+      for (const family of Object.keys(LOGIN_TARGETS)) {
+        if (profileLooksBound(profileDirFor(family, dataDir))) {
+          startKeepAlive(family).catch(() => {})
+        }
+      }
+    }, 3_000)
+    bootTimer.unref?.()
+    ctx.effect(() => () => clearTimeout(bootTimer), 'dsh-meter: keepalive boot timer')
+  }
+
   ctx.inject(['webServer'], (webCtx) => {
     const json = (res, code, payload) => {
       res.writeHead(code, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
@@ -1448,6 +2453,11 @@ document.getElementById('save').onclick = async () => {
     const sameOrigin = (req) => {
       const site = req.headers['sec-fetch-site']
       return typeof site !== 'string' || site === 'same-origin' || site === 'none'
+    }
+    const readJsonBody = async (req) => {
+      const chunks = []
+      for await (const chunk of req) chunks.push(chunk)
+      return JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}')
     }
 
     ctx.effect(() => webCtx.webServer.register({
@@ -1485,16 +2495,11 @@ document.getElementById('save').onclick = async () => {
         if (!sameOrigin(req)) return json(res, 403, { error: 'cross-site request refused' })
         if (req.method === 'POST') {
           try {
-            const chunks = []
-            for await (const chunk of req) chunks.push(chunk)
-            const body = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}')
+            const body = await readJsonBody(req)
             const cookie = String(body.cookie ?? '').trim()
             if (cookie.length === 0) return json(res, 400, { status: 'error', message: 'cookie is empty' })
             await queryUncached(family, cookie)
-            await ensureCredentialRef()
-            const credentials = ctx.get('credentials')
-            if (credentials !== undefined) await credentials.set(ref(CONSOLE_TARGETS[family].envName), cookie)
-            cache.clear()
+            await saveConsoleCookie(family, cookie)
             return json(res, 200, { status: 'ok' })
           } catch (error) {
             return json(res, 200, {
@@ -1525,7 +2530,7 @@ document.getElementById('save').onclick = async () => {
             }
             return json(res, 200, { family, balance: await account.getBalance(accountClientMetadata(ctx)) })
           }
-          const secret = await secretFor(family, row)
+          const secret = await secretFor(family, row, provider)
           if (secret === null) return json(res, 200, { status: 'no-credential', family })
           if (family === 'deepseek-official') {
             const { status, data } = await fetchJson(`${deepseekOfficialOrigin(readDeepseekRoute(ctx))}/user/balance`, {
@@ -1564,6 +2569,27 @@ document.getElementById('save').onclick = async () => {
             return json(res, 200, { family, usage, detail, balance })
           }
           let target = null
+          if (family === 'sub2api') {
+            const usageUrl = sub2apiUsageUrl(row.baseURL)
+            if (usageUrl === null) return json(res, 200, { status: 'no-base-url', family })
+            const { status, data } = await fetchJson(usageUrl, {
+              headers: { authorization: `Bearer ${secret}`, accept: 'application/json', 'user-agent': BROWSER_UA },
+            })
+            return json(res, 200, { status, family, data })
+          }
+          if (family === 'new-api') {
+            const root = gatewayRootUrl(row.baseURL)
+            if (root === null) return json(res, 200, { status: 'no-base-url', family })
+            const headers = { authorization: `Bearer ${secret}`, accept: 'application/json', 'user-agent': BROWSER_UA }
+            const { startDate, endDate } = newApiBillingDateRange()
+            const [statusRes, tokenRes, subRes, usageRes] = await Promise.all([
+              fetchJson(`${root}/api/status`, { headers: { accept: 'application/json', 'user-agent': BROWSER_UA } }).catch(() => null),
+              fetchNewApiTokenUsage(root, headers),
+              fetchJson(`${root}/v1/dashboard/billing/subscription`, { headers }).catch(() => null),
+              fetchJson(`${root}/v1/dashboard/billing/usage?start_date=${startDate}&end_date=${endDate}`, { headers }).catch(() => null),
+            ])
+            return json(res, 200, { family, root, statusRes, tokenRes, subRes, usageRes })
+          }
           if (family === 'opencode-go') target = 'https://opencode.ai/zen/go/v1/usage'
           else if (family === 'kimi') target = 'https://api.kimi.com/coding/v1/usages'
           else if (family === 'minimax') target = 'https://www.minimaxi.com/v1/token_plan/remains'
@@ -1598,6 +2624,23 @@ document.getElementById('save').onclick = async () => {
 
     ctx.effect(() => webCtx.webServer.register({
       kind: 'exact',
+      path: `${ROUTE_PREFIX}/login/sync-edge`,
+      handler: async (req, res) => {
+        try {
+          if (req.method !== 'POST') return json(res, 405, { error: 'method not allowed' })
+          if (!sameOrigin(req)) return json(res, 403, { error: 'cross-site request refused' })
+          const url = new URL(req.url ?? '/', 'http://localhost')
+          const family = url.searchParams.get('family') ?? ''
+          if (LOGIN_TARGETS[family] === undefined) return json(res, 400, { status: 'error', message: 'sync-edge supports the stepfun / mimo families only' })
+          return json(res, 200, await syncConsoleFromEdge(family, { interactive: true }))
+        } catch (error) {
+          return json(res, 500, { status: 'error', message: String(error?.message ?? error) })
+        }
+      },
+    }))
+
+    ctx.effect(() => webCtx.webServer.register({
+      kind: 'exact',
       path: `${ROUTE_PREFIX}/login/status`,
       handler: async (req, res) => {
         const url = new URL(req.url ?? '/', 'http://localhost')
@@ -1614,6 +2657,69 @@ document.getElementById('save').onclick = async () => {
         const family = url.searchParams.get('family') ?? ''
         if (req.method !== 'POST') return json(res, 405, { error: 'method not allowed' })
         return json(res, 200, cancelLoginSession(family))
+      },
+    }))
+
+    ctx.effect(() => webCtx.webServer.register({
+      kind: 'exact',
+      path: `${ROUTE_PREFIX}/providers`,
+      handler: async (req, res) => {
+        try {
+          if (req.method !== 'GET') return json(res, 405, { error: 'method not allowed' })
+          if (!sameOrigin(req)) return json(res, 403, { error: 'cross-site request refused' })
+          const url = new URL(req.url ?? '/', 'http://localhost')
+          const probe = url.searchParams.get('probe') === '1'
+          const force = url.searchParams.get('force') === '1'
+          return json(res, 200, { status: 'ok', providers: await buildProviderInventory({ probe, force }) })
+        } catch (error) {
+          return json(res, 500, { status: 'error', message: String(error?.message ?? error), providers: [] })
+        }
+      },
+    }))
+
+    ctx.effect(() => webCtx.webServer.register({
+      kind: 'exact',
+      path: `${ROUTE_PREFIX}/gateways`,
+      handler: async (req, res) => {
+        try {
+          if (req.method !== 'POST') return json(res, 405, { error: 'method not allowed' })
+          if (!sameOrigin(req)) return json(res, 403, { error: 'cross-site request refused' })
+          let body = null
+          try {
+            body = await readJsonBody(req)
+          } catch {
+            return json(res, 400, { status: 'error', message: 'invalid JSON body' })
+          }
+          const map = loadGatewayMap(dataDir)
+          if (body?.action === 'reset-suppressed') {
+            for (const [key, value] of Object.entries(map)) {
+              if (value === 'none') delete map[key]
+            }
+            saveGatewayMap(dataDir, map)
+            gatewayProbed.clear()
+            cache.clear()
+            return json(res, 200, { status: 'ok', providers: await buildProviderInventory({ probe: true, force: true }) })
+          }
+          const providerId = String(body?.provider ?? '').trim()
+          if (providerId.length === 0) return json(res, 400, { status: 'error', message: 'missing provider' })
+          const lower = providerId.toLowerCase()
+          for (const key of Object.keys(map)) {
+            if (key.toLowerCase() === lower) delete map[key]
+          }
+          const targetFamily = body?.family
+          if (targetFamily === null || targetFamily === undefined || targetFamily === '') {
+            // Removed from explicit overrides.
+          } else if (targetFamily === 'sub2api' || targetFamily === 'new-api' || targetFamily === 'none') {
+            map[providerId] = targetFamily
+          } else {
+            return json(res, 400, { status: 'error', message: 'invalid gateway family' })
+          }
+          saveGatewayMap(dataDir, map)
+          cache.clear()
+          return json(res, 200, { status: 'ok', providers: await buildProviderInventory({ probe: false }) })
+        } catch (error) {
+          return json(res, 500, { status: 'error', message: String(error?.message ?? error) })
+        }
       },
     }))
 
@@ -1693,7 +2799,10 @@ document.getElementById('save').onclick = async () => {
           }
         }
         const rows = readProviderRows(ctx)
-        out.providerFamilies = Object.fromEntries(Object.keys(rows).map((ns) => [ns, detectFamily(ns, rows[ns]?.baseURL)]))
+        out.providerFamilies = Object.fromEntries(
+          Object.keys(rows).map((ns) => [ns, familyContext(ns)?.family ?? detectFamily(ns, rows[ns]?.baseURL)]),
+        )
+        out.gatewayMap = loadGatewayMap(dataDir)
         out.officialFamilies = {
           'deepseek-account': detectFamily('deepseek-account'),
           'deepseek-official': detectFamily('deepseek-official'),

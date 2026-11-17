@@ -28,7 +28,10 @@ window.__ModuleLoader__.load({
     const QUOTA_URL = '/plugins/dsh-meter/quota'
     const SETUP_URL = '/plugins/dsh-meter/setup'
     const LOGIN_URL = '/plugins/dsh-meter/login'
+    const PROVIDERS_URL = '/plugins/dsh-meter/providers'
+    const GATEWAYS_URL = '/plugins/dsh-meter/gateways'
     const LOG_URL = '/plugins/dsh-meter/log'
+    const EDGE_DEBUG_URL = 'edge://inspect/#remote-debugging'
 
     // Best-effort client report so the Host can answer "did it run?" over /status.
     function report (kind, detail) {
@@ -111,12 +114,34 @@ window.__ModuleLoader__.load({
         wBalance: 'Balance',
         wBonus: 'Granted',
         wPlan: 'Plan',
+        wQuota: 'Quota',
+        wToday: 'Today',
+        wUsed: 'Used',
         wOther: 'Window',
         familyDeepseekAccount: 'DeepSeek Account',
         familyDeepseek: 'DeepSeek',
         notConnected: 'Not linked',
+        cookieExpired: 'Cookie expired — sync from Edge or re-bind',
+        syncEdge: 'Read Cookie from Edge',
+        syncEdgeBusy: 'Reading from Edge…',
+        syncEdgeOk: 'Synced from {browser} ✓',
+        syncEdgeHint: 'Reads directly from your running Edge session (enable remote debugging once at edge://inspect/#remote-debugging).',
+        copyEdgeUrl: 'Copy Edge debug link',
+        gatewaySection: 'Self-hosted Gateways (Sub2API / New API)',
+        gatewayHint: 'Gateways are auto-detected from each provider URL, or assign any custom provider via the dropdown below.',
+        gatewayRescan: 'Auto-detect by URL',
+        gatewayScanning: 'Detecting…',
+        gatewaySelectPlaceholder: 'Select a configured provider…',
+        gatewayAdd: 'Add',
+        gatewayRemove: 'Remove',
+        gatewayAutoTag: 'Auto',
+        gatewayManualTag: 'Custom',
+        gatewayEmpty: 'No providers linked yet.',
+        gatewayNoCandidates: 'No more providers available',
+        sub2apiDesc: 'Sub2API gateway (/v1/usage) — subscription windows, quota, rate limits, and wallet balance.',
+        newApiDesc: 'New API / One API gateway (/api/usage/token & billing) — token quota and account balance.',
         balanceNote: 'Balance plans (reuse the signed-in account or API key, nothing to bind)',
-        apiKeyHint: 'MiniMax · Kimi · OpenCode Go — the badge reports the fastest-refreshing window (rolling first, otherwise weekly / monthly).',
+        apiKeyHint: 'MiniMax · Kimi · OpenCode Go · Sub2API · New API — the badge reports the fastest-refreshing window or remaining balance.',
         balanceHint: 'DeepSeek Account / DeepSeek — balance-metered, so the badge shows the remaining amount.',
       },
       zh: {
@@ -171,12 +196,34 @@ window.__ModuleLoader__.load({
         wBalance: '余额',
         wBonus: '赠送',
         wPlan: '套餐',
+        wQuota: '总额度',
+        wToday: '今日',
+        wUsed: '已用',
         wOther: '窗口',
         familyDeepseekAccount: 'DeepSeek 账号',
         familyDeepseek: 'DeepSeek',
         notConnected: '未连接',
+        cookieExpired: 'Cookie 已过期，请从 Edge 读取或重新绑定',
+        syncEdge: '从 Edge 读取 Cookie',
+        syncEdgeBusy: '正在读取 Edge Cookie…',
+        syncEdgeOk: '已从 {browser} 读取并绑定 ✓',
+        syncEdgeHint: '直接读取当前 Edge 浏览器的登录态（首次需在 Edge 打开 edge://inspect/#remote-debugging 开启远程调试）。',
+        copyEdgeUrl: '复制 Edge 调试地址',
+        gatewaySection: '自建网关（Sub2API / New API）',
+        gatewayHint: '插件会自动通过各 provider 的 URL 识别类型，也可以用下面的下拉框手动绑定或移除。',
+        gatewayRescan: '重新通过 URL 自动识别',
+        gatewayScanning: '正在识别…',
+        gatewaySelectPlaceholder: '选择已配置的 provider…',
+        gatewayAdd: '添加',
+        gatewayRemove: '移除',
+        gatewayAutoTag: '自动识别',
+        gatewayManualTag: '手动绑定',
+        gatewayEmpty: '暂未关联任何 provider。',
+        gatewayNoCandidates: '没有可添加的 provider',
+        sub2apiDesc: 'Sub2API 网关（/v1/usage）— 支持订阅周期、总额度、速率限制和钱包余额。',
+        newApiDesc: 'New API / One API 网关（/api/usage/token 与 billing 接口）— 支持令牌额度和账户余额。',
         balanceNote: '余额类（复用已登录账号 / API Key，无需绑定）',
-        apiKeyHint: 'MiniMax · Kimi · OpenCode Go — 徽章显示刷新周期最短的那一档额度（有滚动就显示滚动，没有滚动才退到周 / 月）。',
+        apiKeyHint: 'MiniMax · Kimi · OpenCode Go · Sub2API · New API — 徽章显示刷新周期最短的那一档额度或剩余余额。',
         balanceHint: 'DeepSeek 账号 / DeepSeek — 按余额计量，徽章直接显示剩余金额。',
       },
     }
@@ -208,6 +255,9 @@ window.__ModuleLoader__.load({
       balance: 'wBalance',
       bonus: 'wBonus',
       plan: 'wPlan',
+      quota: 'wQuota',
+      today: 'wToday',
+      used: 'wUsed',
       week: 'w7d',
       month: 'w30d',
     }
@@ -291,6 +341,16 @@ window.__ModuleLoader__.load({
 .qm-mini{color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px}
 .qm-login{display:flex;flex-direction:column;gap:8px;padding:10px 12px;border:1px solid var(--dsw-alias-border-l1);
   border-radius:8px;background:var(--dsw-alias-bg-layer-1)}
+.qm-select{flex:1;min-width:160px;max-width:100%;border:1px solid var(--dsw-alias-border-l1);border-radius:6px;
+  padding:5px 8px;font:inherit;font-size:12px;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary)}
+.qm-select:focus{outline:none;border-color:var(--dsw-alias-border-l2)}
+.qm-gw-list{display:flex;flex-direction:column;gap:6px}
+.qm-gw-row{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;padding:6px 8px;
+  border:1px solid var(--dsw-alias-border-l1);border-radius:6px;background:var(--dsw-alias-bg-layer-1)}
+.qm-gw-meta{display:flex;align-items:center;gap:6px;min-width:0;flex:1;flex-wrap:wrap}
+.qm-gw-url{color:var(--dsw-alias-label-tertiary);font-size:11px;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.qm-tag{font-size:10px;padding:1px 5px;border-radius:4px;border:1px solid var(--dsw-alias-border-l1);color:var(--dsw-alias-label-secondary)}
+.qm-sec-row{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:4px}
 `
 
     // ── helpers ─────────────────────────────────────────────────────────
@@ -719,6 +779,8 @@ window.__ModuleLoader__.load({
       const [message, setMessage] = React.useState(null)
       const [copied, setCopied] = React.useState(false)
       const [manual, setManual] = React.useState(false)
+      const [edgeSync, setEdgeSync] = React.useState({ busy: false, okBrowser: null, error: null })
+      const [edgeCopied, setEdgeCopied] = React.useState(false)
       const ref = React.useRef(null)
       const login = useLoginFlow(plan, t, onBound)
 
@@ -757,6 +819,34 @@ window.__ModuleLoader__.load({
           if (!ok) return
           setCopied(true)
           window.setTimeout(() => setCopied(false), 1800)
+        })
+      }
+
+      const syncFromEdge = () => {
+        setEdgeSync({ busy: true, okBrowser: null, error: null })
+        fetch(`${LOGIN_URL}/sync-edge?family=${encodeURIComponent(plan.family)}`, {
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: { accept: 'application/json' },
+        })
+          .then((response) => response.json())
+          .then((data) => {
+            if (data.status === 'ok') {
+              setEdgeSync({ busy: false, okBrowser: data.browser ?? 'Edge', error: null })
+              report('edge-sync-ok', `${plan.family} ${data.via ?? 'direct'}`)
+              onBound()
+            } else {
+              setEdgeSync({ busy: false, okBrowser: null, error: String(data.message ?? t('autoFailed')) })
+            }
+          })
+          .catch((error) => setEdgeSync({ busy: false, okBrowser: null, error: String(error?.message ?? error) }))
+      }
+
+      const copyEdgeUrl = () => {
+        copyText(EDGE_DEBUG_URL).then((ok) => {
+          if (!ok) return
+          setEdgeCopied(true)
+          window.setTimeout(() => setEdgeCopied(false), 1800)
         })
       }
 
@@ -799,15 +889,31 @@ window.__ModuleLoader__.load({
               type: 'button',
               className: 'qm-btn qm-primary',
               onClick: login.start,
-              disabled: loginActive,
+              disabled: loginActive || edgeSync.busy,
             }, loginActive ? login.phaseText : t('autoLogin')),
+            h('button', {
+              type: 'button',
+              className: 'qm-btn',
+              onClick: syncFromEdge,
+              disabled: loginActive || edgeSync.busy,
+            }, edgeSync.busy ? t('syncEdgeBusy') : t('syncEdge')),
             loginActive ? h('button', { type: 'button', className: 'qm-btn', onClick: login.cancel }, t('autoCancel')) : null,
+          ),
+          h('div', { className: 'qm-btnrow' },
+            h('span', { className: 'qm-note' }, t('syncEdgeHint')),
+            h('button', { type: 'button', className: 'qm-link', onClick: copyEdgeUrl }, edgeCopied ? t('copied') : t('copyEdgeUrl')),
           ),
           loginPhase !== 'idle'
             ? h('div', { className: loginTone }, login.phaseText)
             : null,
           login.state?.lastError !== null && login.state?.lastError !== undefined && loginPhase !== 'bound'
             ? h('div', { className: 'qm-note' }, `控制台返回：${login.state.lastError}`)
+            : null,
+          edgeSync.okBrowser !== null
+            ? h('div', { className: 'qm-ok' }, t('syncEdgeOk', { browser: edgeSync.okBrowser }))
+            : null,
+          typeof edgeSync.error === 'string'
+            ? h('div', { className: 'qm-error' }, edgeSync.error)
             : null,
         ),
         h('div', { className: 'qm-btnrow' },
@@ -1002,15 +1108,22 @@ window.__ModuleLoader__.load({
 
     // ── settings section ────────────────────────────────────────────────
 
+    function formatQuotaSummary (data, t) {
+      const parts = [
+        ...percentWindows(data).map((win) => `${windowLabel(win.key, t)} ${Math.round(remainingOf(win))}%`),
+        ...textWindows(data).map((win) => `${windowLabel(win.key, t)} ${win.text}`),
+      ]
+      return parts.join(' · ') || 'ok'
+    }
+
     function ConsoleCard ({ plan, t }) {
       const [nonce, setNonce] = React.useState(0)
       const data = useJson(`${QUOTA_URL}?family=${encodeURIComponent(plan.family)}`, nonce)
       let status = h('span', { className: 'qm-note' }, t('loading'))
       if (data.status === 'ok') {
-        const rows = percentWindows(data).map((win) => `${windowLabel(win.key, t)} ${Math.round(remainingOf(win))}%`)
-        status = h('span', { className: 'qm-ok' }, `✓ ${rows.join(' · ') || 'ok'}`)
+        status = h('span', { className: 'qm-ok' }, `✓ ${formatQuotaSummary(data, t)}`)
       } else if (data.status === 'no-credential') {
-        status = h('span', { className: 'qm-note' }, t('notBound'))
+        status = h('span', { className: 'qm-note' }, data.expired === true ? t('cookieExpired') : t('notBound'))
       } else if (data.status === 'error') {
         status = h('span', { className: 'qm-error' }, String(data.message ?? t('queryFailed')))
       }
@@ -1020,6 +1133,178 @@ window.__ModuleLoader__.load({
           status,
         ),
         h(BindForm, { plan, t, onBound: () => setNonce((n) => n + 1) }),
+      )
+    }
+
+    function GatewayProviderRow ({ item, family, t, onRemove }) {
+      const [nonce, setNonce] = React.useState(0)
+      const [busy, setBusy] = React.useState(false)
+      const data = useJson(`${QUOTA_URL}?provider=${encodeURIComponent(item.id)}&family=${encodeURIComponent(family)}`, nonce)
+
+      let reading = h('span', { className: 'qm-note' }, t('loading'))
+      if (data.status === 'ok') {
+        reading = h('span', { className: 'qm-ok' }, `✓ ${formatQuotaSummary(data, t)}`)
+      } else if (data.status === 'no-credential') {
+        reading = h('span', { className: 'qm-note' }, String(data.message ?? t('notConnected')))
+      } else if (data.status === 'error') {
+        reading = h('span', { className: 'qm-error' }, String(data.message ?? t('queryFailed')))
+      }
+
+      return h('div', { className: 'qm-gw-row' },
+        h('div', { className: 'qm-gw-meta' },
+          h('span', { className: 'qm-card-title' }, item.id),
+          h('span', { className: 'qm-tag' }, item.source === 'manual' ? t('gatewayManualTag') : t('gatewayAutoTag')),
+          item.baseURL ? h('span', { className: 'qm-gw-url', title: item.baseURL }, item.baseURL) : null,
+          reading,
+        ),
+        h('div', { className: 'qm-btnrow' },
+          h('button', { type: 'button', className: 'qm-link', onClick: () => setNonce((n) => n + 1) }, t('refresh')),
+          h('button', {
+            type: 'button',
+            className: 'qm-link',
+            disabled: busy,
+            onClick: () => {
+              setBusy(true)
+              Promise.resolve(onRemove(item.id, item.source)).finally(() => setBusy(false))
+            },
+          }, t('gatewayRemove')),
+        ),
+      )
+    }
+
+    function GatewayCard ({ family, title, desc, providers, busy, t, onAssign, onRemove }) {
+      const [selected, setSelected] = React.useState('')
+      const matched = providers.filter((p) => p.family === family)
+      const candidates = providers.filter((p) => p.family !== family && !p.builtin)
+      const effectiveSelected = candidates.some((c) => c.id === selected) ? selected : ''
+
+      return h('div', { className: 'qm-card' },
+        h('div', { className: 'qm-card-head' },
+          h('span', { className: 'qm-card-title' }, title),
+          matched.length > 0 ? h('span', { className: 'qm-note' }, `${matched.length}`) : null,
+        ),
+        h('div', { className: 'qm-mini' }, desc),
+        matched.length > 0
+          ? h('div', { className: 'qm-gw-list' },
+              matched.map((item) => h(GatewayProviderRow, { key: item.id, item, family, t, onRemove })),
+            )
+          : h('div', { className: 'qm-note' }, t('gatewayEmpty')),
+        h('div', { className: 'qm-btnrow' },
+          h('select', {
+            className: 'qm-select',
+            value: effectiveSelected,
+            disabled: busy || candidates.length === 0,
+            'aria-label': title,
+            onChange: (event) => setSelected(event.target.value),
+          },
+          h('option', { value: '' }, candidates.length > 0 ? t('gatewaySelectPlaceholder') : t('gatewayNoCandidates')),
+          candidates.map((c) => h('option', { key: c.id, value: c.id }, c.baseURL ? `${c.id} (${c.baseURL})` : c.id))),
+          h('button', {
+            type: 'button',
+            className: 'qm-btn',
+            disabled: busy || effectiveSelected === '',
+            onClick: () => {
+              const id = effectiveSelected
+              setSelected('')
+              onAssign(id, family)
+            },
+          }, t('gatewayAdd')),
+        ),
+      )
+    }
+
+    function GatewaySection ({ t }) {
+      const [providers, setProviders] = React.useState([])
+      const [loading, setLoading] = React.useState(true)
+      const [scanning, setScanning] = React.useState(false)
+      const [busy, setBusy] = React.useState(false)
+      const [error, setError] = React.useState(null)
+
+      React.useEffect(() => {
+        let alive = true
+        fetch(`${PROVIDERS_URL}?probe=1`, {
+          credentials: 'same-origin',
+          headers: { accept: 'application/json' },
+        })
+          .then((response) => (response.ok ? response.json() : Promise.reject(new Error(`HTTP ${response.status}`))))
+          .then((data) => {
+            if (!alive) return
+            if (Array.isArray(data.providers)) setProviders(data.providers)
+            else setError(String(data.message ?? t('queryFailed')))
+          })
+          .catch((err) => { if (alive) setError(String(err?.message ?? err)) })
+          .finally(() => { if (alive) setLoading(false) })
+        return () => { alive = false }
+      }, [])
+
+      const postGateway = (payload) => fetch(GATEWAYS_URL, {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'content-type': 'application/json', accept: 'application/json' },
+        body: JSON.stringify(payload),
+      })
+        .then((response) => (response.ok ? response.json() : Promise.reject(new Error(`HTTP ${response.status}`))))
+        .then((data) => {
+          if (data.status === 'ok' && Array.isArray(data.providers)) {
+            setProviders(data.providers)
+            setError(null)
+          } else {
+            setError(String(data.message ?? t('queryFailed')))
+          }
+        })
+        .catch((err) => setError(String(err?.message ?? err)))
+
+      const rescan = () => {
+        setScanning(true)
+        setError(null)
+        postGateway({ action: 'reset-suppressed' }).finally(() => setScanning(false))
+      }
+
+      const assign = (provider, family) => {
+        setBusy(true)
+        setError(null)
+        return postGateway({ provider, family }).finally(() => setBusy(false))
+      }
+
+      const remove = (provider, source) => {
+        setBusy(true)
+        setError(null)
+        return postGateway({ provider, family: source === 'manual' ? null : 'none' }).finally(() => setBusy(false))
+      }
+
+      return h(React.Fragment, null,
+        h('div', { className: 'qm-sec-row' },
+          h('span', { className: 'qm-sec' }, t('gatewaySection')),
+          h('button', {
+            type: 'button',
+            className: 'qm-btn',
+            disabled: scanning || busy,
+            onClick: rescan,
+          }, scanning ? t('gatewayScanning') : t('gatewayRescan')),
+        ),
+        h('div', { className: 'qm-mini' }, t('gatewayHint')),
+        loading ? h('div', { className: 'qm-note' }, t('loading')) : null,
+        typeof error === 'string' ? h('div', { className: 'qm-error' }, error) : null,
+        h(GatewayCard, {
+          family: 'sub2api',
+          title: 'Sub2API',
+          desc: t('sub2apiDesc'),
+          providers,
+          busy: busy || scanning,
+          t,
+          onAssign: assign,
+          onRemove: remove,
+        }),
+        h(GatewayCard, {
+          family: 'new-api',
+          title: 'New API',
+          desc: t('newApiDesc'),
+          providers,
+          busy: busy || scanning,
+          t,
+          onAssign: assign,
+          onRemove: remove,
+        }),
       )
     }
 
@@ -1033,8 +1318,7 @@ window.__ModuleLoader__.load({
       const data = useJson(`${QUOTA_URL}?family=${encodeURIComponent(family)}`, nonce)
       let status = h('span', { className: 'qm-note' }, t('loading'))
       if (data.status === 'ok') {
-        const rows = textWindows(data).map((win) => `${windowLabel(win.key, t)} ${win.text}`)
-        status = h('span', { className: 'qm-ok' }, `✓ ${rows.join(' · ') || 'ok'}`)
+        status = h('span', { className: 'qm-ok' }, `✓ ${formatQuotaSummary(data, t)}`)
       } else if (data.status === 'no-credential') {
         status = h('span', { className: 'qm-note' }, String(data.message ?? t('notConnected')))
       } else if (data.status === 'error') {
@@ -1060,6 +1344,7 @@ window.__ModuleLoader__.load({
             h('style', null, CSS),
             h('div', { className: 'qm-sec' }, t('consoleNote')),
             CONSOLE_PLANS.map((plan) => h(ConsoleCard, { key: plan.family, plan, t })),
+            h(GatewaySection, { t }),
             h('div', { className: 'qm-sec' }, t('apiKeyNote')),
             h('div', { className: 'qm-mini' }, t('apiKeyHint')),
             h('div', { className: 'qm-mini' }, t('balanceHint')),

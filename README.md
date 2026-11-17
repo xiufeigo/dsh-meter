@@ -38,12 +38,35 @@
 | **OpenCode Go** | `zen/go/v1/usage` | 否，复用已有 API Key |
 | **DeepSeek 账号** | DSH 账号钱包余额（`deepseekAccount.getBalance`） | 否，复用已登录的 DSH 账号 |
 | **DeepSeek** | `GET /user/balance` | 否，复用已有 API Key |
-| **StepFun** | 控制台 `QueryStepPlanRateLimit` | 是，浏览器登录一次 |
-| **小米 MiMo** | 控制台 `tokenPlan/usage` | 是，浏览器登录一次 |
+| **StepFun** | 控制台 `QueryStepPlanRateLimit` | 是，浏览器登录一次或从 Edge 读取 |
+| **小米 MiMo** | 控制台 `tokenPlan/usage` | 是，浏览器登录一次或从 Edge 读取 |
+| **Sub2API** | 自建网关 `GET {baseURL}/v1/usage` | 否，复用该 provider 自己的 API Key |
+| **New API / One API** | 自建网关 `/api/usage/token` 与 `/v1/dashboard/billing/*` | 否，复用该 provider 自己的 API Key |
 
 小米的几个通道都能识别：`xiaomi`、`xiaomi-token-plan-cn`、`xiaomi-token-plan-ams`、`xiaomi-token-plan-sgp`、以及走 OpenCode Go 转发但模型名是 `mimo-*` 的情况。
 
 两条 DeepSeek 官方通道都是**按余额计量**（预充值 / 赠送额度），没有「滚动 / 周」这类百分比窗口，所以徽章显示的是剩余金额（如 `¥58.04`）而不是圆环百分比；`DeepSeek 账号` 走 DSH 已登录的账号，`DeepSeek` 走模型设置里的 `DEEPSEEK_API_KEY`。
+
+### 自建网关：Sub2API 与 New API（自动识别 + 下拉框自定义）
+
+插件支持为任意自定义 provider 展示 **Sub2API** 和 **New API / One API** 的额度与余额：
+
+1. **通过 URL 自动识别**：
+   - 命名空间或 `baseURL` 含 `sub2api` / `new-api` / `one-api` 等关键字时直接命中；
+   - 否则自动探测 `{baseURL}/api/status`、`{baseURL}/v1/usage`、`/api/usage/token/` 与 `/v1/dashboard/billing/subscription`，识别后按 `baseURL` 缓存。
+2. **设置页下拉框自定义**：
+   - 打开 **设置 → 内置插件 → 额度徽章 → 自建网关（Sub2API / New API）**；
+   - 点击 **重新通过 URL 自动识别** 可立即探测所有自定义 provider；
+   - 也可以在 **Sub2API** 或 **New API** 卡片的下拉框里手动选择任意 provider 并点 **添加**（保存在 `~/.dsh/dsh-meter/gateways.json`）。
+3. 仍然兼容在 `cordis.patch.yml` 里给插件配置 `sub2apiProviders` / `newApiProviders`（按 provider 名或 baseURL 子串匹配）：
+
+```yaml
+- id: quota-meter
+  name: dsh-meter
+  config:
+    sub2apiProviders: [openai, d1studio]
+    newApiProviders: [myrelay]
+```
 
 ## 安装
 
@@ -82,9 +105,19 @@ MiniMax / Kimi / OpenCode Go / DeepSeek 直接复用「设置 → 模型」里�
 
 **DeepSeek 账号**则复用 DSH「设置 → 账号」里已登录的账号：插件通过 DSH 的账号服务读取钱包余额，自己**不接触**账号令牌；没登录时徽章显示 `🔒 未连接`，登录后刷新即可。
 
-### 控制台类：登录一次
+### 控制台类：登录一次 / 从日常 Edge 直接同步
 
-**StepFun** 和 **小米 MiMo** 的套餐额度只在控制台里，需要绑一次登录态：
+**StepFun** 和 **小米 MiMo** 的套餐额度只在控制台里，需要绑一次登录态，支持三种方式：
+
+#### 方式一：直接从日常 Edge 读取 Cookie（推荐，过期后可自动静默续签）
+
+1. 在你平时使用的 Edge 地址栏打开 `edge://inspect/#remote-debugging`，打开远程调试开关（Edge 会在本地生成 `DevToolsActivePort`）
+2. 在 Edge 里正常登录 StepFun / 小米 MiMo 控制台
+3. 在插件设置或绑定弹窗里点击「**从 Edge 读取 Cookie**」（首次连接时 Edge 顶部会弹出授权提示，点击**允许**即可）
+
+之后当 StepFun 或 MiMo 的短期 Cookie 过期时，插件会自动从开启了远程调试的 Edge 读取最新 Cookie 续上（如果 Edge 中只有长期 SSO 登录态、短期控制台 token 已过期，插件还会自动借由无头浏览器用该 SSO 登录态静默换取新 token）。
+
+#### 方式二：插件内置浏览器登录并自动绑定
 
 1. 切到对应模型，圆环会变成 `🔒 绑定`，点它
    （也可以走 设置 → 内置插件 → 额度仪表）
@@ -92,7 +125,7 @@ MiniMax / Kimi / OpenCode Go / DeepSeek 直接复用「设置 → 模型」里�
 3. 会弹出你电脑的**默认浏览器**（Windows 上是 Edge）并打开控制台登录页
 4. 在里面正常登录 → 插件自动读取 Cookie、校验、绑定，**不需要手动复制任何东西**
 
-绑定成功后浏览器配置会留在 `%USERPROFILE%\.dsh\dsh-meter\browser-profiles\`，以后再失效通常**不弹窗**就能静默续上。
+绑定成功后浏览器配置会留在 `%USERPROFILE%\.dsh\dsh-meter\browser-profiles\`，插件启动时也会自动唤醒后台保活页；遇到过期会自动尝试从 Edge 或保活配置静默续上。
 
 不想用浏览器？绑定弹窗里还有「或者手动粘贴 Cookie · 展开」的兜底路径。
 
@@ -113,10 +146,11 @@ MiniMax / Kimi / OpenCode Go / DeepSeek 直接复用「设置 → 模型」里�
 ```
 ┌──────────────── DSH Host 进程 ────────────────┐        ┌──── 浏览器 ────┐
 │  index.js                                     │        │                │
-│   ├─ /plugins/dsh-meter/quota   额度查询       │        │  控制台登录页   │
-│   ├─ /plugins/dsh-meter/login   拉起浏览器     │◀──CDP──│  (Edge/Chrome) │
-│   ├─ /plugins/dsh-meter/setup   手动 Cookie    │  管道  │                │
-│   └─ /plugins/dsh-meter/status  诊断           │        └────────────────┘
+│   ├─ /plugins/dsh-meter/quota      额度查询    │        │  控制台登录页   │
+│   ├─ /plugins/dsh-meter/login      拉起/读Edge │◀──CDP──│  (Edge/Chrome) │
+│   ├─ /plugins/dsh-meter/providers  网关识别    │  管道/ │                │
+│   ├─ /plugins/dsh-meter/gateways   网关绑定    │  WS    └────────────────┘
+│   └─ /plugins/dsh-meter/status     诊断        │
 └───────────────────────▲───────────────────────┘
                         │ same-origin fetch
 ┌───────────────────────┴───────────────────────┐
@@ -144,7 +178,7 @@ MiniMax / Kimi / OpenCode Go / DeepSeek 直接复用「设置 → 模型」里�
 ```bash
 git clone https://github.com/xiufeigo/dsh-meter.git
 cd dsh-meter
-npm test          # 用假 React 渲染客户端两种状态，校验文案和 DOM 结构
+npm test          # 运行前端渲染冒烟测试 + Host 路由与识别测试
 npm run pack:release
 ```
 
@@ -162,6 +196,7 @@ dsh plugin --profile desktop add "C:\path\to\dsh-meter"
 | 路由 | 用途 |
 |---|---|
 | `GET /plugins/dsh-meter/status` | 客户端是否装载、provider 路由、凭据状态、客户端日志 |
+| `GET /plugins/dsh-meter/providers?probe=1` | 列出所有 provider 及其自动识别 / 手动绑定状态 |
 | `GET /plugins/dsh-meter/raw?family=...` | 各套餐的原始用量响应（不含密钥） |
 | `GET /plugins/dsh-meter/hmr` | 让客户端模块重新装载，免刷新 |
 | `GET /plugins/dsh-meter/keepalive?family=...` | 手动启停后台保活浏览器 |

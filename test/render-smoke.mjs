@@ -117,15 +117,15 @@ if (typeof api?.apply !== 'function') throw new Error('client half exported no a
 api.apply(ctx)
 
 // ── renderer: walk elements, running function components ──────────────
-function toText (node, depth = 0) {
-  if (depth > 40) return ''
-  if (node === null || node === undefined || node === false || node === true) return ''
+function expandNode (node, depth = 0) {
+  if (depth > 40) return null
+  if (node === null || node === undefined || node === false || node === true) return null
   if (typeof node === 'string' || typeof node === 'number') return String(node)
-  if (Array.isArray(node)) return node.map((child) => toText(child, depth + 1)).join('')
-  if (typeof node !== 'object') return ''
-  if ('portal' in node) return toText(node.portal, depth + 1)
+  if (Array.isArray(node)) return node.map((child) => expandNode(child, depth + 1))
+  if (typeof node !== 'object') return null
+  if ('portal' in node) return expandNode(node.portal, depth + 1)
   const { type, props } = node
-  if (type === React.Fragment) return toText(props?.children, depth + 1)
+  if (type === React.Fragment) return expandNode(props?.children, depth + 1)
   if (typeof type === 'function') {
     let rendered
     if (type.prototype !== undefined && typeof type.prototype.render === 'function') {
@@ -135,10 +135,24 @@ function toText (node, depth = 0) {
     } else {
       rendered = type(props)
     }
-    return toText(rendered, depth + 1)
+    return expandNode(rendered, depth + 1)
   }
-  if (type === 'style') return ''
-  return toText(props?.children, depth + 1)
+  if (type === 'style') return null
+  return { type, props: { ...(props ?? {}), children: expandNode(props?.children, depth + 1) } }
+}
+
+function toText (node, depth = 0) {
+  const expanded = depth === 0 ? expandNode(node, 0) : node
+  if (expanded === null || expanded === undefined) return ''
+  if (typeof expanded === 'string') return expanded
+  if (Array.isArray(expanded)) return expanded.map((child) => toText(child, depth + 1)).join('')
+  return toText(expanded.props?.children, depth + 1)
+}
+
+function countElements (expanded, tag) {
+  if (expanded === null || expanded === undefined || typeof expanded === 'string') return 0
+  if (Array.isArray(expanded)) return expanded.reduce((n, c) => n + countElements(c, tag), 0)
+  return (expanded.type === tag ? 1 : 0) + countElements(expanded.props?.children, tag)
 }
 
 const styles = (node) => toText(node) // placeholder
@@ -243,16 +257,34 @@ for (const expected of ['Usage limits', 'Rolling', 'Weekly', 'Monthly', 'left 10
   if (!text.includes(expected)) problems.push(`en panel: missing "${expected}"`)
 }
 
-// ── 8. settings section ───────────────────────────────────────────────
+// ── 8. settings section (zh + en) ────────────────────────────────────
 activeLocale = 'zh'
 const settingsReg = registrations.find((entry) => entry.name === 'settings.plugins.tab')
 STUBS = []
-const settingsTree = settingsReg.comp()
-text = toText(settingsTree)
+const settingsTreeZh = settingsReg.comp()
+const settingsExpandedZh = expandNode(settingsTreeZh)
+text = toText(settingsExpandedZh, 1)
 notes.push(`[settings-zh] ${text.trim()}`)
-for (const expected of ['StepFun', '小米 MiMo', '浏览器登录并自动绑定', '控制台类套餐']) {
-  if (!text.includes(expected)) problems.push(`settings: missing "${expected}"`)
+for (const expected of ['StepFun', '小米 MiMo', '浏览器登录并自动绑定', '从 Edge 读取 Cookie', '控制台类套餐', 'Sub2API', 'New API', '重新通过 URL 自动识别']) {
+  if (!text.includes(expected)) problems.push(`settings zh: missing "${expected}"`)
 }
+if (countElements(settingsExpandedZh, 'select') < 2) {
+  problems.push(`settings zh: expected >= 2 <select> dropdowns for Sub2API & New API, got ${countElements(settingsExpandedZh, 'select')}`)
+}
+
+activeLocale = 'en'
+STUBS = []
+const settingsTreeEn = settingsReg.comp()
+const settingsExpandedEn = expandNode(settingsTreeEn)
+text = toText(settingsExpandedEn, 1)
+notes.push(`[settings-en] ${text.trim()}`)
+for (const expected of ['StepFun', 'Open browser & bind automatically', 'Read Cookie from Edge', 'Sub2API', 'New API', 'Auto-detect by URL']) {
+  if (!text.includes(expected)) problems.push(`settings en: missing "${expected}"`)
+}
+if (countElements(settingsExpandedEn, 'select') < 2) {
+  problems.push(`settings en: expected >= 2 <select> dropdowns for Sub2API & New API, got ${countElements(settingsExpandedEn, 'select')}`)
+}
+activeLocale = 'zh'
 
 // ── 9. single-window plan: no redundant row, only the reset line ──────
 const singlePayload = {
@@ -346,6 +378,70 @@ text = toText(tree)
 notes.push(`[balance-open-en] ${text.trim()}`)
 for (const expected of ['DeepSeek Account', 'Usage limits', 'Balance', 'Granted', '¥12.34']) {
   if (!text.includes(expected)) problems.push(`en balance panel: missing "${expected}"`)
+}
+activeLocale = 'zh'
+
+// ── 14. Sub2API & New API gateway panels (zh + en) ────────────────────
+const sub2apiPayload = {
+  status: 'ok', family: 'sub2api', providerLabel: 'Sub2API · d1studio',
+  fetchedAt: Date.now(), provider: 'd1studio',
+  windows: [
+    { key: '1d', percent: 10, resetsAt: null },
+    { key: 'quota', percent: 25, resetsAt: null },
+    { key: 'balance', percent: null, resetsAt: null, text: '$8.50' },
+    { key: 'today', percent: null, resetsAt: null, text: '$1.20' },
+  ],
+}
+tree = renderCell('conversation.composer.dock', {
+  useProjection: selectionOf('d1studio', 'claude-sonnet'),
+  t,
+}, [true, null, 0, sub2apiPayload])
+text = toText(tree)
+notes.push(`[sub2api-open-zh] ${text.trim()}`)
+for (const expected of ['Sub2API · d1studio', '剩余 90%', '总额度', '75%', '余额', '$8.50', '今日', '$1.20']) {
+  if (!text.includes(expected)) problems.push(`sub2api zh panel: missing "${expected}"`)
+}
+
+activeLocale = 'en'
+tree = renderCell('conversation.composer.dock', {
+  useProjection: selectionOf('d1studio', 'claude-sonnet'),
+  t,
+}, [true, null, 0, sub2apiPayload])
+text = toText(tree)
+notes.push(`[sub2api-open-en] ${text.trim()}`)
+for (const expected of ['Sub2API · d1studio', 'left 90%', 'Quota', 'Balance', '$8.50', 'Today', '$1.20']) {
+  if (!text.includes(expected)) problems.push(`sub2api en panel: missing "${expected}"`)
+}
+activeLocale = 'zh'
+
+const newApiPayload = {
+  status: 'ok', family: 'new-api', providerLabel: 'New API · myrelay',
+  fetchedAt: Date.now(), provider: 'myrelay',
+  windows: [
+    { key: 'quota', percent: 40, resetsAt: new Date(Date.now() + 3600e3 * 48).toISOString() },
+    { key: 'balance', percent: null, resetsAt: null, text: '$12.00' },
+    { key: 'used', percent: null, resetsAt: null, text: '$8.00' },
+  ],
+}
+tree = renderCell('conversation.composer.dock', {
+  useProjection: selectionOf('myrelay', 'gpt-4o'),
+  t,
+}, [true, null, 0, newApiPayload])
+text = toText(tree)
+notes.push(`[newapi-open-zh] ${text.trim()}`)
+for (const expected of ['New API · myrelay', '剩余 60%', '余额', '$12.00', '已用', '$8.00']) {
+  if (!text.includes(expected)) problems.push(`new-api zh panel: missing "${expected}"`)
+}
+
+activeLocale = 'en'
+tree = renderCell('conversation.composer.dock', {
+  useProjection: selectionOf('myrelay', 'gpt-4o'),
+  t,
+}, [true, null, 0, newApiPayload])
+text = toText(tree)
+notes.push(`[newapi-open-en] ${text.trim()}`)
+for (const expected of ['New API · myrelay', 'left 60%', 'Balance', '$12.00', 'Used', '$8.00']) {
+  if (!text.includes(expected)) problems.push(`new-api en panel: missing "${expected}"`)
 }
 activeLocale = 'zh'
 
