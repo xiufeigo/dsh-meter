@@ -130,11 +130,13 @@ MiniMax / Kimi / OpenCode Go / DeepSeek 直接复用「设置 → 模型」里�
 ① 账密重登（StepFun）        ─┐
 ② 保活页重落到控制台，重走 SSO  ├─ 全部静默，0 弹窗
 ③ 用本地 profile 重启 headless ─┘
-④ 都失败 → 弹一次登录窗口（30 分钟内最多一次，账号密码自动填好）
+④ 静默连续失败 3 次 → 才弹一次登录窗口（30 分钟内最多一次，账号密码自动填好）
 ⑤ Edge 读取 → 只在你手动点按钮时才连
 ```
 
-一轮恢复失败后按 1 → 2 → 5 → 10 → 30 分钟指数退避；绑定成功即清零。徽章在 🔒 态下每 3 分钟轮询一次，但后端退避保证不会每次都触发浏览器或 Edge。
+每一轮静默失败后按 1 → 2 → 5 → 10 → 30 分钟退避；绑定成功即清零、计数归零。StepFun 配了账号密码后，静默路径就是账密重登本身，不会再启浏览器。徽章在 🔒 态下每 3 分钟轮询一次，但后端退避保证不会每次都触发浏览器或 Edge；从不曾绑定过的套餐不会自动弹窗，点 🔒 手动绑。
+
+可用配置项（`cordis.patch.yml`）：`recoverBackoffMs`（退避时间表，毫秒数组）、`silentFailuresBeforeWindow`（几次静默失败后才弹窗，默认 3）。
 
 #### Edge 读取（仅手动兜底）
 
@@ -227,7 +229,7 @@ dsh plugin --profile desktop add "C:\path\to\dsh-meter"
 - 控制台登录需要 Chromium 系浏览器（Chrome / Edge / Brave / Vivaldi / Opera），Firefox 不支持 `--remote-debugging-pipe`
 - 控制台接口一旦改版，对应的解析要跟着改；StepFun 账密登录依赖其 Passport 接口（`RegisterDevice` / `SignInByPassword`），改版时同样要跟着改
 - 小米首次在新 profile 上登录必须短信验证码（风控要求），账密只能省掉输密码，省不掉验证码；之后 profile 受信就不再要
-- 插件配置项（`cordis.patch.yml`）：`disableAutoKeepAlive`（不启保活浏览器）、`disableAutoLoginWindow`（恢复失败时不自动弹登录窗）、`headlessRefreshMs`（保活重落的等待上限，默认 15000）
+- 插件配置项（`cordis.patch.yml`）：`disableAutoKeepAlive`（不启保活浏览器）、`disableAutoLoginWindow`（永不自动弹登录窗）、`headlessRefreshMs`（保活重落的等待上限，默认 15000）、`silentFailuresBeforeWindow`（几次静默失败后才弹窗，默认 3）、`recoverBackoffMs`（退避时间表）
 - DeepSeek 两条官方通道只有余额接口，没有公开的「套餐百分比」接口；余额接口改版时对应解析要跟着改
 - 插件只把百分比、余额、重置时间和套餐名回传给界面，**不显示也不外传任何密钥、Cookie 或账号令牌**
 

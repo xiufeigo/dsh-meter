@@ -492,19 +492,22 @@ try {
   assert.equal(passportCalls.filter((c) => c.method === 'SignInByPassword').length, 4)
   assert.equal(wsConnections, wsAfterLogin, 'password recovery never touches Edge')
 
-  // Wrong password later: the error is surfaced, the ladder backs off, and
-  // still no Edge and no window.
+  // Wrong password later: the error is surfaced as the first of several
+  // silent rounds, the ladder backs off, and still no Edge and no window.
   h1.credMap.set('STEPFUN_PASSWORD', 'nope')
   h1.credMap.set('STEPFUN_COOKIE', `Oasis-Webid=w; Oasis-Token=${fakeJwt(3600, 'retired-2')}`)
   const failedRecover = await h1.invoke('/plugins/dsh-meter/quota', { query: '?provider=stepfun&model=step-5' })
   assert.equal(failedRecover.json.status, 'no-credential')
   assert.equal(failedRecover.json.expired, true)
-  assert.ok(failedRecover.json.message.includes('账号密码登录失败'))
+  assert.equal(failedRecover.json.loginWindow, undefined)
+  assert.ok(failedRecover.json.message.includes('正在静默续期（第 1/3 次'), failedRecover.json.message)
+  assert.ok(failedRecover.json.message.includes('password is wrong'))
   assert.ok(failedRecover.json.retryAfter > 0)
   assert.equal(wsConnections, wsAfterLogin)
   // While backing off, a poll does not try the password again.
   const duringBackoff = await h1.invoke('/plugins/dsh-meter/quota', { query: '?provider=stepfun&model=step-5' })
   assert.equal(duringBackoff.json.status, 'no-credential')
+  assert.ok(duringBackoff.json.message.includes('第 1/3 次'))
   assert.equal(passportCalls.filter((c) => c.method === 'SignInByPassword').length, 5)
   // Clearing the account reports "not configured" and never returns secrets.
   const cleared = await h1.invoke('/plugins/dsh-meter/account', {
@@ -526,6 +529,55 @@ try {
   assert.equal(status.json.accounts.stepfun.configured, false)
   assert.equal(status.json.accounts.mimo.configured, false)
   assert.equal(typeof status.json.recovery.stepfun.failures, 'number')
+  assert.equal(status.json.silentFailuresBeforeWindow, 3)
+
+  // ── 1c. Three silent rounds must fail in a row before a window opens ──
+  // A fresh harness: no backoff (config.recoverBackoffMs), the window allowed,
+  // keepalive off, and `node` standing in for the browser so the window
+  // "launch" fails fast instead of flashing a real one on the desktop.
+  const previousBrowser = process.env.DSH_QUOTA_BROWSER
+  process.env.DSH_QUOTA_BROWSER = process.execPath
+  const h3dataDir = path.join(tempRoot, 'meter-data-h3')
+  const h3 = makeMockHarness({ providersInherited, providersOverride, envCreds: { STEPFUN_COOKIE: 'Oasis-Webid=w; sessionid=expired-1' } })
+  apply(h3.ctx, { dataDir: h3dataDir, edgeUserDataDir, disableAutoKeepAlive: true, recoverBackoffMs: [0, 0, 0, 0, 0] })
+  // A previously bound profile is what makes a session "recoverable".
+  const stepfunProfile = path.join(h3dataDir, 'browser-profiles', 'stepfun')
+  fs.mkdirSync(stepfunProfile, { recursive: true })
+  fs.writeFileSync(path.join(stepfunProfile, '.dsh-bound'), new Date().toISOString(), 'utf8')
+  const rounds = []
+  for (const [n, tag] of [[1, 'e1'], [2, 'e22'], [3, 'e333']]) {
+    // Different lengths: the quota cache keys on the secret's prefix + length.
+    h3.credMap.set('STEPFUN_COOKIE', `Oasis-Webid=w; sessionid=expired-${tag}`)
+    const res = await h3.invoke('/plugins/dsh-meter/quota', { query: '?provider=stepfun&model=step-5' })
+    const login = await h3.invoke('/plugins/dsh-meter/login/status', { query: '?family=stepfun' })
+    rounds.push({ n, status: res.json.status, window: res.json.loginWindow, round: res.json.message?.match(/第 (\d)\/3 次/)?.[1], started: login.json.phase !== 'idle' })
+  }
+  // Rounds 1 and 2 stay silent; the third opens the window (its "browser" is
+  // node, which exits at once, so the session winds down on its own).
+  assert.deepEqual(rounds.map((r) => [r.status, r.window ?? null, r.round ?? null, r.started]), [
+    ['no-credential', null, '1', false],
+    ['no-credential', null, '2', false],
+    ['no-credential', 'opened', null, true],
+  ])
+  assert.equal(wsConnections, wsAfterLogin, 'the ladder never touches Edge')
+  const h3status = await h3.invoke('/plugins/dsh-meter/status')
+  assert.equal(h3status.json.recovery.stepfun.failures, 3)
+  assert.equal(h3status.json.silentFailuresBeforeWindow, 3)
+  // Let the third round's session finish (node-as-browser exits at once), so
+  // the next round is judged on its own.
+  for (let i = 0; i < 40; i += 1) {
+    const login = await h3.invoke('/plugins/dsh-meter/login/status', { query: '?family=stepfun' })
+    if (!['starting', 'checking', 'waiting'].includes(login.json.phase)) break
+    await new Promise((resolve) => setTimeout(resolve, 50))
+  }
+  // Within the 30-minute window gap no second window opens: the round just counts.
+  h3.credMap.set('STEPFUN_COOKIE', 'Oasis-Webid=w; sessionid=expired-e4444')
+  const fourth = await h3.invoke('/plugins/dsh-meter/quota', { query: '?provider=stepfun&model=step-5' })
+  assert.equal(fourth.json.status, 'no-credential')
+  assert.equal(fourth.json.loginWindow, undefined)
+  assert.ok(fourth.json.message.includes('已连续失败 4 次'), fourth.json.message)
+  process.env.DSH_QUOTA_BROWSER = previousBrowser
+  h3.dispose()
 
   // ── 2. URL auto-detection via /providers?probe=1 ────────────────────
   const probeRes = await h1.invoke('/plugins/dsh-meter/providers', { query: '?probe=1' })

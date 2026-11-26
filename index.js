@@ -601,7 +601,9 @@ const KEEPALIVE_FIRST_TICK_MS = 4_000
 // the parked page sat idle. Re-validate at this interval regardless.
 const KEEPALIVE_REVALIDATE_MS = 5 * 60_000
 // Silent recovery (password re-login, parked page reload, headless restart)
-// is free; a visible login window is not, so it opens at most this often.
+// is free; a visible login window is not. It opens only after this many
+// silent rounds have failed in a row, and at most this often.
+const SILENT_FAILURES_BEFORE_WINDOW = 3
 const AUTO_LOGIN_WINDOW_GAP_MS = 30 * 60_000
 // Exponential backoff after a recovery round fails, so a signed-out account
 // cannot turn every badge poll into a browser launch.
@@ -2260,58 +2262,89 @@ export function apply(ctx, config = {}) {
     return state
   }
 
+  function recoverBackoffSchedule() {
+    const custom = config.recoverBackoffMs
+    if (Array.isArray(custom)) {
+      const list = custom.map(Number).filter((ms) => Number.isFinite(ms) && ms >= 0)
+      if (list.length > 0) return list
+    }
+    return RECOVER_BACKOFF_MS
+  }
+
+  /** Silent rounds that must fail in a row before a visible window is opened. */
+  function silentFailuresBeforeWindow() {
+    const n = Number(config.silentFailuresBeforeWindow)
+    return Number.isInteger(n) && n >= 1 ? n : SILENT_FAILURES_BEFORE_WINDOW
+  }
+
   /** Milliseconds until the next recovery round may run (0 = now). */
   function recoverBlockedMs(family) {
     const state = recoverState.get(family)
     if (state === undefined || state.failures === 0) return 0
-    const delay = RECOVER_BACKOFF_MS[Math.min(state.failures, RECOVER_BACKOFF_MS.length) - 1]
+    const schedule = recoverBackoffSchedule()
+    const delay = schedule[Math.min(state.failures, schedule.length) - 1]
     return Math.max(0, state.lastFailAt + delay - Date.now())
   }
 
   /**
-   * A console family's saved session was rejected. Climb the ladder, each rung
-   * silent: password sign-in (StepFun), then the parked browser re-landing on
+   * A console family's saved session was rejected. Climb the silent rungs
+   * first — password sign-in (StepFun), then the parked browser re-landing on
    * the console so its own front end re-runs the sign-in round trip. Only when
-   * both fail does a visible login window open — at most twice an hour — with
-   * a stored username + password typed in ahead of time (MiMo may still ask
-   * for an SMS code, which only the user can read). Edge is never touched
-   * here; it stays a manual button.
+   * `silentFailuresBeforeWindow` rounds have failed in a row does a visible
+   * login window open, at most twice an hour, with a stored username + password
+   * typed in ahead of time (MiMo may still ask for an SMS code, which only the
+   * user can read). Edge is never touched here; it stays a manual button.
    */
   async function recoverConsoleSession(family, { allowWindow = true } = {}) {
+    const failureCount = () => recoverState.get(family)?.failures ?? 0
     // A login window is already open for this family: it holds the profile
     // and the badge is watching it, so there is nothing to do until it ends.
     const session = LOGIN_SESSIONS.get(family)
     if (session !== undefined && (session.phase === 'starting' || session.phase === 'checking' || session.phase === 'waiting')) {
-      return { recovered: false, via: 'window', window: 'opened', retryAfter: 0 }
+      return { recovered: false, via: 'window', window: 'opened', retryAfter: 0, failures: failureCount() }
     }
     const blocked = recoverBlockedMs(family)
-    if (blocked > 0) return { recovered: false, retryAfter: blocked }
+    if (blocked > 0) return { recovered: false, retryAfter: blocked, failures: failureCount() }
+    const state = recoverBackoff(family)
     const account = await accountFor(family).catch(() => null)
-    // 1. Password sign-in (StepFun): no browser at all. A rejection from the
-    //    last moments is still fresh; do not hammer the passport service.
-    const lastLoginFailedAgo = Date.now() - (lastLoginFailedAt.get(family) ?? 0)
-    if (family === 'stepfun' && account !== null && lastLoginFailedAgo >= 30_000) {
-      if (await stepfunRelogin().catch(() => false)) return { recovered: true, via: 'password', retryAfter: 0 }
+    // For StepFun a stored password is the silent path: no browser can help
+    // (its profile holds no SSO cookie to re-exchange), so none is launched.
+    const passwordIsTheSilentPath = family === 'stepfun' && account !== null
+    // Rung 1: password sign-in. A rejection from the last moments is still
+    // fresh; do not hammer the passport service.
+    let via = null
+    if (passwordIsTheSilentPath) {
+      const lastLoginFailedAgo = Date.now() - (lastLoginFailedAt.get(family) ?? 0)
+      if (lastLoginFailedAgo >= 30_000 && await stepfunRelogin().catch(() => false)) via = 'password'
     }
-    if (config.disableAutoKeepAlive !== true) {
+    // Rung 2: the parked browser re-lands on the console.
+    if (via === null && config.disableAutoKeepAlive !== true && !passwordIsTheSilentPath) {
       const entry = KEEPALIVE.get(family)
       const ok = entry !== undefined
         ? await reloadAndValidate(family, entry, headlessRefreshMaxWait()).catch(() => false)
         : profileLooksBound(profileDirFor(family, dataDir))
           ? await refreshViaHeadless(family).catch(() => false)
           : false
-      if (ok) return { recovered: true, via: 'parked', retryAfter: 0 }
+      if (ok) via = 'parked'
     }
-    const state = recoverBackoff(family)
+    if (via !== null) {
+      state.failures = 0
+      state.lastFailAt = 0
+      return { recovered: true, via, retryAfter: 0, failures: 0 }
+    }
+    // Every silent rung failed: count the round, back off, and only after
+    // several in a row ask the user with a visible window.
+    state.failures += 1
+    state.lastFailAt = Date.now()
+    const failures = state.failures
     if (allowWindow && config.disableAutoLoginWindow !== true
+      && failures >= silentFailuresBeforeWindow()
       && Date.now() - state.lastWindowAt >= AUTO_LOGIN_WINDOW_GAP_MS) {
       state.lastWindowAt = Date.now()
       startLoginSession(family, { skipHeadless: true, autofill: account })
-      return { recovered: false, via: 'window', window: 'opened', retryAfter: 0 }
+      return { recovered: false, via: 'window', window: 'opened', retryAfter: 0, failures }
     }
-    state.failures = Math.min(state.failures + 1, RECOVER_BACKOFF_MS.length)
-    state.lastFailAt = Date.now()
-    return { recovered: false, retryAfter: recoverBlockedMs(family) }
+    return { recovered: false, retryAfter: recoverBlockedMs(family), failures }
   }
 
   /** Match config.sub2apiProviders / config.newApiProviders allowlists. */
@@ -2676,35 +2709,44 @@ export function apply(ctx, config = {}) {
         if (await stepfunRelogin().catch(() => false)) secret = await secretFor(family, row, provider)
       }
     }
-    let recovery = { recovered: false, retryAfter: 0 }
+    let recovery = { recovered: false, retryAfter: 0, failures: 0 }
+    const wasBound = isConsole && profileLooksBound(profileDirFor(family, dataDir))
     if (isConsole && (secret === null || (family === 'mimo' && !mimoCookieUsable(secret)))) {
-      recovery = await recoverConsoleSession(family)
+      // A profile that was never bound has nothing to recover: the badge asks
+      // the user to sign in, and no window opens by itself.
+      recovery = await recoverConsoleSession(family, { allowWindow: wasBound })
       if (recovery.recovered) secret = await secretFor(family, row, provider)
     }
     const recoveryFields = {
       ...(recovery.retryAfter > 0 ? { retryAfter: recovery.retryAfter } : {}),
       ...(recovery.window === 'opened' ? { loginWindow: 'opened' } : {}),
     }
+    /** What to tell the user about a console session the console rejected. */
+    const recoveryMessage = (fallback) => {
+      if (recovery.window === 'opened') return `${FAMILY_LABELS[family]} 登录窗口已打开，完成登录后徽章会自动恢复`
+      if (!wasBound) return fallback
+      const needed = silentFailuresBeforeWindow()
+      const head = recovery.failures < needed
+        ? `${FAMILY_LABELS[family]} 登录已过期，正在静默续期（第 ${recovery.failures}/${needed} 次，连续 ${needed} 次失败后会打开登录窗口）`
+        : `${FAMILY_LABELS[family]} 静默续期已连续失败 ${recovery.failures} 次；登录窗口每 30 分钟最多打开一次，也可以点此手动绑定`
+      const loginError = lastLoginError.get(family)
+      return loginError === undefined ? head : `${head}：${loginError}`
+    }
 
     if (secret === null) {
       const keyHints = row?.apiKeyEnv
         ? String(row.apiKeyEnv)
         : (FAMILY_KEY_ENVS[family] ?? []).join(' / ')
-      const loginError = lastLoginError.get(family)
       return {
         status: 'no-credential',
-        expired: recovery.window === 'opened' || loginError !== undefined,
+        expired: wasBound || recovery.window === 'opened' || lastLoginError.has(family),
         provider,
         family,
         providerLabel,
         setupFamily: isConsole ? family : null,
         message: !isConsole
           ? `no API key found for ${providerLabel} (set ${keyHints})`
-          : recovery.window === 'opened'
-            ? `${FAMILY_LABELS[family]} 登录窗口已打开，完成登录后徽章会自动恢复`
-            : loginError !== undefined
-              ? `${FAMILY_LABELS[family]} 账号密码登录失败：${loginError}`
-              : `${FAMILY_LABELS[family]} console cookie not configured — sign in from Settings → 内置插件 → 额度徽章, or click the badge`,
+          : recoveryMessage(`${FAMILY_LABELS[family]} console cookie not configured — sign in from Settings → 内置插件 → 额度徽章, or click the badge`),
         windows: [],
         ...recoveryFields,
       }
@@ -2738,7 +2780,7 @@ export function apply(ctx, config = {}) {
         // problem, not a query failure: climb the silent recovery ladder
         // (password sign-in, parked browser) before prompting the user.
         if (isConsole && error?.authExpired === true) {
-          const recovery = await recoverConsoleSession(family)
+          recovery = await recoverConsoleSession(family, { allowWindow: wasBound })
           if (recovery.recovered) {
             const fresh = await secretFor(family, row, provider)
             if (fresh !== null) {
@@ -2750,7 +2792,6 @@ export function apply(ctx, config = {}) {
               } catch { /* fall through to the re-bind prompt */ }
             }
           }
-          const loginError = lastLoginError.get(family)
           const value = {
             status: 'no-credential',
             expired: true,
@@ -2758,11 +2799,7 @@ export function apply(ctx, config = {}) {
             providerLabel,
             setupFamily: family,
             fetchedAt: Date.now(),
-            message: recovery.window === 'opened'
-              ? `${FAMILY_LABELS[family]} 登录窗口已打开，完成登录后徽章会自动恢复`
-              : loginError !== undefined
-                ? `${FAMILY_LABELS[family]} 账号密码登录失败：${loginError}`
-                : error.message,
+            message: recoveryMessage(error.message),
             windows: [],
             ...(recovery.retryAfter > 0 ? { retryAfter: recovery.retryAfter } : {}),
             ...(recovery.window === 'opened' ? { loginWindow: 'opened' } : {}),
@@ -3500,6 +3537,7 @@ document.getElementById('save').onclick = async () => {
           blockedMs: recoverBlockedMs(family),
           lastWindowAgoMs: state.lastWindowAt === 0 ? null : Date.now() - state.lastWindowAt,
         }]))
+        out.silentFailuresBeforeWindow = silentFailuresBeforeWindow()
         out.loginSessions = [...LOGIN_SESSIONS.values()].map(loginSnapshot)
         const webApp = ctx.get('webApp')
         if (webApp !== undefined && typeof webApp.getAdvertisedUrl === 'function') {
