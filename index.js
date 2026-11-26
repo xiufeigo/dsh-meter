@@ -211,7 +211,21 @@ async function fetchJson(url, { method = 'GET', headers = {}, body, timeoutMs = 
   } catch {
     data = null
   }
-  return { status: response.status, ok: response.ok, data }
+  return { status: response.status, ok: response.ok, data, setCookies: parseSetCookies(response.headers) }
+}
+
+/** `Set-Cookie` lines as plain `{ name, value }` pairs: all a cookie jar needs here. */
+function parseSetCookies(headers) {
+  if (headers === undefined || headers === null) return []
+  const lines = typeof headers.getSetCookie === 'function'
+    ? headers.getSetCookie()
+    : [headers.get?.('set-cookie') ?? '']
+  const out = []
+  for (const line of lines) {
+    const match = /^\s*([^\s=;]+)=([^;]*)/.exec(String(line ?? ''))
+    if (match !== null && match[1].length > 0) out.push({ name: match[1], value: match[2] })
+  }
+  return out
 }
 
 function httpError(status, message) {
@@ -1426,8 +1440,19 @@ function stepfunTokenExpiryMs(cookieHeader) {
   return jwtExpiryMs(cookieValueOf(cookieHeader, 'Oasis-Token'))
 }
 
-function stepfunPassportHeaders(cookie, webid) {
-  return {
+/**
+ * Request headers the console's own client sends on every passport call
+ * (see its interceptor): app id, platform, and the web id once the browser
+ * has one. A fresh browser has no web id yet, so that header is simply
+ * absent rather than empty.
+ *
+ * No `Oasis-Token` header is ever sent here on purpose. The server treats
+ * that header as the bearer credential and rejects the anonymous device
+ * token with "token is illegal" — the console only adds the header once a
+ * signed-in token exists in its cookie jar, i.e. never for the sign-in call.
+ */
+function stepfunPassportHeaders(cookie, { webid = '' } = {}) {
+  const headers = {
     accept: 'application/json',
     'content-type': 'application/json',
     origin: STEPFUN_ORIGIN,
@@ -1435,9 +1460,10 @@ function stepfunPassportHeaders(cookie, webid) {
     'user-agent': BROWSER_UA,
     'oasis-appid': '10300',
     'oasis-platform': 'web',
-    'oasis-webid': webid,
-    cookie,
   }
+  if (webid.length > 0) headers['oasis-webid'] = webid
+  if (cookie.length > 0) headers.cookie = cookie
+  return headers
 }
 
 /** The ingress controller's sticky-session cookie from the landing page. */
@@ -1478,17 +1504,39 @@ function passportErrorMessage(data) {
 /**
  * Sign in to StepFun with a username + password and return the cookie header
  * the usage API accepts, plus when that token retires.
+ *
+ * This mirrors what the console does in a fresh browser, step by step — the
+ * passport service rejects anything else as an "illegal" token (verified
+ * against the live service):
+ *   1. GET the landing page        → INGRESSCOOKIE (sticky session)
+ *   2. RegisterDevice with `{}`    → anonymous access token; no web id is sent
+ *      yet, and the server answers with the device's own Oasis-Webid and
+ *      Oasis-Token cookies, which are kept like a browser would
+ *   3. SignInByPassword            → those cookies as they are, the device id
+ *      as web id, and no Oasis-Token header (a header token is validated as
+ *      a bearer, and the anonymous one is not a legal bearer)
+ *   4. the signed-in token replaces Oasis-Token, exactly as the console's
+ *      own `document.cookie` write does after a successful sign-in
  */
 async function stepfunPasswordLogin(username, password) {
-  const ingress = await fetchStepfunIngressCookie()
-  let webid = globalThis.crypto.randomUUID()
-  const base = `${ingress.length > 0 ? `${ingress}; ` : ''}Oasis-Webid=${webid}`
+  const jar = new Map()
+  const absorb = (pairs) => {
+    for (const { name, value } of pairs ?? []) jar.set(name, value)
+  }
+  const cookieHeader = () => [...jar].map(([name, value]) => `${name}=${value}`).join('; ')
+  const landing = await fetchJson(`${STEPFUN_ORIGIN}/`, {
+    headers: { accept: 'text/html', 'user-agent': BROWSER_UA },
+    attempts: 1,
+  }).catch(() => null)
+  absorb(landing?.setCookies)
+
   const registered = await fetchJson(`${STEPFUN_PASSPORT}/RegisterDevice`, {
     method: 'POST',
-    headers: stepfunPassportHeaders(base, webid),
+    headers: stepfunPassportHeaders(cookieHeader()),
     body: '{}',
     attempts: 1,
   })
+  absorb(registered.setCookies)
   const anonymous = stepfunAccessToken(registered.data)
   if (!registered.ok || anonymous.raw === null) {
     const reason = passportErrorMessage(registered.data)
@@ -1496,15 +1544,18 @@ async function stepfunPasswordLogin(username, password) {
   }
   // The console adopts the server's device id as its web id after registering.
   const deviceId = registered.data?.device?.deviceID ?? registered.data?.device?.device_id
-  if (typeof deviceId === 'string' && deviceId.length > 0) {
-    webid = deviceId
-  }
+  const webid = typeof deviceId === 'string' && deviceId.length > 0
+    ? deviceId
+    : (jar.get('Oasis-Webid') ?? globalThis.crypto.randomUUID())
+  if (!jar.has('Oasis-Webid')) jar.set('Oasis-Webid', webid)
+
   const signed = await fetchJson(`${STEPFUN_PASSPORT}/SignInByPassword`, {
     method: 'POST',
-    headers: stepfunPassportHeaders(`${base}; Oasis-Token=${anonymous.raw}`, webid),
+    headers: stepfunPassportHeaders(cookieHeader(), { webid }),
     body: JSON.stringify({ username, password }),
     attempts: 1,
   })
+  absorb(signed.setCookies)
   const access = stepfunAccessToken(signed.data)
   if (!signed.ok || access.raw === null) {
     const reason = passportErrorMessage(signed.data)
@@ -1512,9 +1563,17 @@ async function stepfunPasswordLogin(username, password) {
     error.authRejected = true
     throw error
   }
-  const cookieHeader = `${ingress.length > 0 ? `${ingress}; ` : ''}Oasis-Webid=${webid}; Oasis-Token=${access.raw}`
+  // The signed-in token supersedes whatever the server set during the exchange.
+  jar.set('Oasis-Webid', webid)
+  jar.set('Oasis-Token', access.raw)
+  // Stable, browser-like order: routing cookie, identity, token, the rest.
+  const priority = ['INGRESSCOOKIE', 'Oasis-Webid', 'Oasis-Token']
+  const ordered = priority.filter((name) => jar.has(name))
+    .concat([...jar.keys()].filter((name) => !priority.includes(name)))
+  const cookieHeaderValue = ordered.map((name) => `${name}=${jar.get(name)}`).join('; ')
   return {
-    header: cookieHeader,
+    header: cookieHeaderValue,
+    webid,
     expiresAt: jwtExpiryMs(access.raw) ?? (access.duration !== null ? Date.now() + access.duration * 1000 : null),
     duration: access.duration,
   }
@@ -3466,6 +3525,8 @@ export const internals = {
   stepfunTokenExpiryMs,
   stepfunAccessToken,
   passportErrorMessage,
+  parseSetCookies,
+  stepfunPasswordLogin,
   maskAccount,
   mimoCookieUsable,
   loginAutofillExpression,

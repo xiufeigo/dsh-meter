@@ -102,7 +102,7 @@ function makeMockFetch (handler) {
     return {
       status,
       ok: status >= 200 && status < 300,
-      headers: { get: () => null, getSetCookie: () => [] },
+      headers: { get: () => null, getSetCookie: () => result?.setCookies ?? [] },
       async text () { return bodyText },
     }
   }
@@ -198,6 +198,12 @@ try {
     assert.equal(internals.stepfunAccessToken({ access_token: { raw: 'r' } }).duration, null)
     assert.equal(internals.passportErrorMessage({ code: 'unauthenticated', message: 'wrong password' }), 'wrong password')
     assert.equal(internals.passportErrorMessage({ details: [{ code: 1, message: 'no such user' }] }), 'no such user')
+    assert.deepEqual(internals.parseSetCookies({ getSetCookie: () => ['INGRESSCOOKIE=ing-1; Path=/; HttpOnly', 'Oasis-Token=a=b=c; Secure', 'broken'] }), [
+      { name: 'INGRESSCOOKIE', value: 'ing-1' },
+      { name: 'Oasis-Token', value: 'a=b=c' },
+    ])
+    assert.deepEqual(internals.parseSetCookies({ get: () => 'Oasis-Webid=w1; Path=/' }), [{ name: 'Oasis-Webid', value: 'w1' }])
+    assert.deepEqual(internals.parseSetCookies(undefined), [])
     assert.equal(internals.maskAccount('13812345678'), '138****78')
     assert.equal(internals.maskAccount('someone@example.com'), 's***@example.com')
     const autofill = internals.loginAutofillExpression('u', 'p')
@@ -213,22 +219,39 @@ try {
     fetchCalls.push({ url, auth: init?.headers?.authorization ?? '' })
     const cookie = String(init?.headers?.cookie ?? '')
 
-    if (url === 'https://platform.stepfun.com/') return { status: 200, body: '<html>console</html>' }
+    if (url === 'https://platform.stepfun.com/') {
+      return { status: 200, body: '<html>console</html>', setCookies: ['INGRESSCOOKIE=ing-1; Path=/; HttpOnly'] }
+    }
     if (url === 'https://platform.stepfun.com/passport/proto.api.passport.v1.PassportService/RegisterDevice') {
-      passportCalls.push({ method: 'RegisterDevice', body: init?.body })
+      passportCalls.push({ method: 'RegisterDevice', body: init?.body, headers: init?.headers })
       assert.equal(init?.headers?.['oasis-appid'], '10300')
+      // A fresh browser has no web id yet: the console sends none here.
+      assert.equal(init?.headers?.['oasis-webid'], undefined)
+      assert.ok(String(init?.headers?.cookie ?? '').includes('INGRESSCOOKIE=ing-1'))
       return {
         status: 200,
+        // The server hands out the device's own cookies; a browser keeps them.
+        setCookies: ['Oasis-Webid=dev-server-1; Path=/; Max-Age=25920000; HttpOnly', 'Oasis-Token=srv-anon-blob; Path=/; HttpOnly'],
         data: { accessToken: { raw: 'anon-token', duration: 3600, mode: 'ANONYMOUS' }, refreshToken: { raw: 'rt-anon' }, device: { deviceID: 'dev-server-1' } },
       }
     }
     if (url === 'https://platform.stepfun.com/passport/proto.api.passport.v1.PassportService/SignInByPassword') {
       const body = JSON.parse(String(init?.body ?? '{}'))
-      passportCalls.push({ method: 'SignInByPassword', body, anonCookie: cookie })
+      passportCalls.push({ method: 'SignInByPassword', body, cookie, headers: init?.headers })
+      // Mirror the console: the server's cookies travel as they are, with
+      // the device id as web id — and no Oasis-Token header, which the live
+      // service rejects with "token is illegal" for the anonymous token.
+      assert.equal(init?.headers?.['oasis-token'], undefined)
+      assert.equal(init?.headers?.['oasis-webid'], 'dev-server-1')
+      assert.ok(cookie.includes('Oasis-Webid=dev-server-1') && cookie.includes('Oasis-Token=srv-anon-blob') && cookie.includes('INGRESSCOOKIE=ing-1'), cookie)
       if (body.username !== 'user@example.com' || body.password !== 'secret') {
-        return { status: 401, data: { code: 'unauthenticated', message: '用户名或密码错误' } }
+        return { status: 400, data: { code: 'invalid_argument', message: 'password is wrong' } }
       }
-      return { status: 200, data: { accessToken: { raw: fakeJwt(stepfunTokenSeconds), duration: stepfunTokenSeconds, mode: 'SIGN_IN' }, refreshToken: { raw: 'rt' } } }
+      return {
+        status: 200,
+        setCookies: ['Oasis-Token=srv-seen; Path=/; HttpOnly'],
+        data: { accessToken: { raw: fakeJwt(stepfunTokenSeconds), duration: stepfunTokenSeconds, mode: 'SIGN_IN' }, refreshToken: { raw: 'rt' } },
+      }
     }
     if (url === 'https://platform.stepfun.com/api/step.openapi.devcenter.Dashboard/QueryStepPlanRateLimit') {
       const token = /Oasis-Token=([^;]+)/.exec(cookie)?.[1] ?? ''
@@ -428,7 +451,7 @@ try {
     method: 'POST', query: '?family=stepfun', body: { username: 'user@example.com', password: 'wrong' },
   })
   assert.equal(badLogin.json.status, 'error')
-  assert.ok(badLogin.json.message.includes('用户名或密码错误'))
+  assert.ok(badLogin.json.message.includes('password is wrong'))
 
   const accountRes = await h1.invoke('/plugins/dsh-meter/account', {
     method: 'POST', query: '?family=stepfun', body: { username: 'user@example.com', password: 'secret' },
@@ -439,13 +462,18 @@ try {
   assert.ok(accountRes.json.expiresAt > Date.now())
   assert.equal(JSON.stringify(accountRes.json).includes('secret'), false, 'the password never echoes back')
   assert.equal(h1.credMap.get('STEPFUN_PASSWORD'), 'secret')
-  assert.ok(h1.credMap.get('STEPFUN_COOKIE').includes('Oasis-Token=ey'))
+  // The bound header is one browser session: ingress cookie, the server's
+  // device id as web id, and the signed-in token overriding the server's.
+  const boundHeader = h1.credMap.get('STEPFUN_COOKIE')
+  assert.ok(boundHeader.startsWith('INGRESSCOOKIE=ing-1; Oasis-Webid=dev-server-1; Oasis-Token=ey'), boundHeader)
+  assert.ok(!boundHeader.includes('srv-seen') && !boundHeader.includes('srv-web'), boundHeader)
   // RegisterDevice was sent with the empty body the console sends, and the
-  // sign-in carried the anonymous token as its Oasis-Token cookie.
+  // sign-in carried the server's own cookies (never the raw anonymous JWT).
   const register = passportCalls.find((c) => c.method === 'RegisterDevice')
   assert.equal(register.body, '{}')
   const signIn = passportCalls.find((c) => c.method === 'SignInByPassword')
-  assert.ok(signIn.anonCookie.includes('Oasis-Token=anon-token'))
+  assert.ok(signIn.cookie.includes('Oasis-Token=srv-anon-blob'))
+  assert.ok(!signIn.cookie.includes('anon-token'))
   const wsAfterLogin = wsConnections
 
   // A JWT about to retire is renewed proactively, before any 401.
