@@ -1517,8 +1517,8 @@ function passportErrorMessage(data) {
  *   3. SignInByPassword            → those cookies as they are, the device id
  *      as web id, and no Oasis-Token header (a header token is validated as
  *      a bearer, and the anonymous one is not a legal bearer)
- *   4. the signed-in token replaces Oasis-Token, exactly as the console's
- *      own `document.cookie` write does after a successful sign-in
+ *   4. the server's Oasis-Token cookie — "<access>...<refresh>", HttpOnly —
+ *      is kept verbatim; the usage API rejects anything else in its place
  */
 async function stepfunPasswordLogin(username, password) {
   const jar = new Map()
@@ -1565,9 +1565,16 @@ async function stepfunPasswordLogin(username, password) {
     error.authRejected = true
     throw error
   }
-  // The signed-in token supersedes whatever the server set during the exchange.
-  jar.set('Oasis-Webid', webid)
-  jar.set('Oasis-Token', access.raw)
+  // The signed-in session is whatever the server handed back, kept verbatim:
+  // its Oasis-Token cookie is "<access>...<refresh>" (HttpOnly, so a real
+  // browser's own cookie write never replaces it), and the usage API insists
+  // on exactly that shape — a bare access JWT there draws "token is illegal".
+  // The access JWT is still what tells us when the session retires.
+  if (!jar.has('Oasis-Token')) {
+    const refresh = signed.data?.refreshToken?.raw ?? signed.data?.refresh_token?.raw
+    jar.set('Oasis-Token', typeof refresh === 'string' && refresh.length > 0 ? `${access.raw}...${refresh}` : access.raw)
+  }
+  if (!jar.has('Oasis-Webid')) jar.set('Oasis-Webid', webid)
   // Stable, browser-like order: routing cookie, identity, token, the rest.
   const priority = ['INGRESSCOOKIE', 'Oasis-Webid', 'Oasis-Token']
   const ordered = priority.filter((name) => jar.has(name))

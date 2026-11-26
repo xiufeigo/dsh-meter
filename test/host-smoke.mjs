@@ -194,6 +194,8 @@ try {
     assert.equal(internals.jwtExpiryMs('not-a-jwt'), null)
     assert.equal(internals.cookieValueOf('a=1; Oasis-Token=ey.abc.sig; b=2', 'Oasis-Token'), 'ey.abc.sig')
     assert.ok(Math.abs(internals.stepfunTokenExpiryMs(`Oasis-Token=${jwt}`) - (Date.now() + 600_000)) < 2_000)
+  // The server's cookie shape: "<access>...<refresh>"; the access part dates it.
+  assert.ok(Math.abs(internals.stepfunTokenExpiryMs(`INGRESSCOOKIE=x; Oasis-Webid=w; Oasis-Token=${jwt}...rt-refresh`) - (Date.now() + 600_000)) < 2_000)
     assert.equal(internals.stepfunAccessToken({ accessToken: { raw: 'r', duration: 90 } }).raw, 'r')
     assert.equal(internals.stepfunAccessToken({ access_token: { raw: 'r' } }).duration, null)
     assert.equal(internals.passportErrorMessage({ code: 'unauthenticated', message: 'wrong password' }), 'wrong password')
@@ -230,8 +232,9 @@ try {
       assert.ok(String(init?.headers?.cookie ?? '').includes('INGRESSCOOKIE=ing-1'))
       return {
         status: 200,
-        // The server hands out the device's own cookies; a browser keeps them.
-        setCookies: ['Oasis-Webid=dev-server-1; Path=/; Max-Age=25920000; HttpOnly', 'Oasis-Token=srv-anon-blob; Path=/; HttpOnly'],
+        // The server hands out the device's own cookies — HttpOnly, and its
+        // Oasis-Token is the combined "<access>...<refresh>"; a browser keeps them.
+        setCookies: ['Oasis-Webid=dev-server-1; Path=/; Max-Age=25920000; HttpOnly', 'Oasis-Token=anon-token...rt-anon; Path=/; Max-Age=25920000; HttpOnly'],
         data: { accessToken: { raw: 'anon-token', duration: 3600, mode: 'ANONYMOUS' }, refreshToken: { raw: 'rt-anon' }, device: { deviceID: 'dev-server-1' } },
       }
     }
@@ -243,23 +246,27 @@ try {
       // service rejects with "token is illegal" for the anonymous token.
       assert.equal(init?.headers?.['oasis-token'], undefined)
       assert.equal(init?.headers?.['oasis-webid'], 'dev-server-1')
-      assert.ok(cookie.includes('Oasis-Webid=dev-server-1') && cookie.includes('Oasis-Token=srv-anon-blob') && cookie.includes('INGRESSCOOKIE=ing-1'), cookie)
+      assert.ok(cookie.includes('Oasis-Webid=dev-server-1') && cookie.includes('Oasis-Token=anon-token...rt-anon') && cookie.includes('INGRESSCOOKIE=ing-1'), cookie)
       if (body.username !== 'user@example.com' || body.password !== 'secret') {
         return { status: 400, data: { code: 'invalid_argument', message: 'password is wrong' } }
       }
       return {
         status: 200,
-        setCookies: ['Oasis-Token=srv-seen; Path=/; HttpOnly'],
+        setCookies: [`Oasis-Token=${fakeJwt(stepfunTokenSeconds)}...rt; Path=/; Max-Age=25920000; HttpOnly`],
         data: { accessToken: { raw: fakeJwt(stepfunTokenSeconds), duration: stepfunTokenSeconds, mode: 'SIGN_IN' }, refreshToken: { raw: 'rt' } },
       }
     }
     if (url === 'https://platform.stepfun.com/api/step.openapi.devcenter.Dashboard/QueryStepPlanRateLimit') {
-      const token = /Oasis-Token=([^;]+)/.exec(cookie)?.[1] ?? ''
+      // Live rule: the Oasis-Token cookie must be the server's combined
+      // "<access>...<refresh>"; a bare access JWT is an illegal token.
+      const token = decodeURIComponent(/Oasis-Token=([^;]+)/.exec(cookie)?.[1] ?? '')
+      const combined = token.includes('...')
+      const access = combined ? token.slice(0, token.indexOf('...')) : token
       let retired = false
       try {
-        retired = String(JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString('utf8')).sub ?? '').startsWith('retired')
+        retired = String(JSON.parse(Buffer.from(access.split('.')[1], 'base64url').toString('utf8')).sub ?? '').startsWith('retired')
       } catch { retired = false }
-      if (!retired && (cookie.includes('sessionid=fresh-from-edge') || cookie.includes('Oasis-Token=ey'))) {
+      if (!retired && (cookie.includes('sessionid=fresh-from-edge') || combined)) {
         return {
           status: 200,
           data: {
@@ -462,30 +469,33 @@ try {
   assert.ok(accountRes.json.expiresAt > Date.now())
   assert.equal(JSON.stringify(accountRes.json).includes('secret'), false, 'the password never echoes back')
   assert.equal(h1.credMap.get('STEPFUN_PASSWORD'), 'secret')
-  // The bound header is one browser session: ingress cookie, the server's
-  // device id as web id, and the signed-in token overriding the server's.
+  // The bound header is one browser session exactly as the server left it:
+  // ingress cookie, the server's device id as web id, and its combined
+  // "<access>...<refresh>" Oasis-Token cookie — never the bare access JWT,
+  // which the live usage API rejects as an illegal token.
   const boundHeader = h1.credMap.get('STEPFUN_COOKIE')
-  assert.ok(boundHeader.startsWith('INGRESSCOOKIE=ing-1; Oasis-Webid=dev-server-1; Oasis-Token=ey'), boundHeader)
-  assert.ok(!boundHeader.includes('srv-seen') && !boundHeader.includes('srv-web'), boundHeader)
+  assert.match(boundHeader, /^INGRESSCOOKIE=ing-1; Oasis-Webid=dev-server-1; Oasis-Token=ey[\w-]+\.[\w-]+\.[\w-]+\.\.\.rt$/, boundHeader)
+  assert.ok(!boundHeader.includes('srv-web') && !boundHeader.includes('srv-anon'), boundHeader)
   // RegisterDevice was sent with the empty body the console sends, and the
   // sign-in carried the server's own cookies (never the raw anonymous JWT).
   const register = passportCalls.find((c) => c.method === 'RegisterDevice')
   assert.equal(register.body, '{}')
   const signIn = passportCalls.find((c) => c.method === 'SignInByPassword')
-  assert.ok(signIn.cookie.includes('Oasis-Token=srv-anon-blob'))
-  assert.ok(!signIn.cookie.includes('anon-token'))
+  assert.ok(signIn.cookie.includes('Oasis-Token=anon-token...rt-anon'))
+  assert.ok(!/Oasis-Token=anon-token(;|$)/.test(signIn.cookie))
   const wsAfterLogin = wsConnections
 
   // A JWT about to retire is renewed proactively, before any 401.
-  h1.credMap.set('STEPFUN_COOKIE', `Oasis-Webid=w; Oasis-Token=${fakeJwt(30)}`)
+  h1.credMap.set('STEPFUN_COOKIE', `Oasis-Webid=w; Oasis-Token=${fakeJwt(30)}...rt`)
   stepfunTokenSeconds = 1800
   const renewed = await h1.invoke('/plugins/dsh-meter/quota', { query: '?provider=stepfun&model=step-5' })
   assert.equal(renewed.json.status, 'ok')
   assert.equal(passportCalls.filter((c) => c.method === 'SignInByPassword').length, 3)
   assert.ok(!h1.credMap.get('STEPFUN_COOKIE').includes(fakeJwt(30).split('.')[1]), 'stale JWT replaced')
+  assert.ok(h1.credMap.get('STEPFUN_COOKIE').endsWith('...rt'), 'renewal keeps the combined cookie shape')
 
   // A token the console rejects (still unexpired) is replaced silently on 401.
-  h1.credMap.set('STEPFUN_COOKIE', `Oasis-Webid=w; Oasis-Token=${fakeJwt(3600, 'retired')}`)
+  h1.credMap.set('STEPFUN_COOKIE', `Oasis-Webid=w; Oasis-Token=${fakeJwt(3600, 'retired')}...rt`)
   const recovered = await h1.invoke('/plugins/dsh-meter/quota', { query: '?provider=stepfun&model=step-5' })
   assert.equal(recovered.json.status, 'ok')
   assert.equal(recovered.json.loginWindow, undefined)
@@ -495,7 +505,7 @@ try {
   // Wrong password later: the error is surfaced as the first of several
   // silent rounds, the ladder backs off, and still no Edge and no window.
   h1.credMap.set('STEPFUN_PASSWORD', 'nope')
-  h1.credMap.set('STEPFUN_COOKIE', `Oasis-Webid=w; Oasis-Token=${fakeJwt(3600, 'retired-2')}`)
+  h1.credMap.set('STEPFUN_COOKIE', `Oasis-Webid=w; Oasis-Token=${fakeJwt(3600, 'retired-2')}...rt`)
   const failedRecover = await h1.invoke('/plugins/dsh-meter/quota', { query: '?provider=stepfun&model=step-5' })
   assert.equal(failedRecover.json.status, 'no-credential')
   assert.equal(failedRecover.json.expired, true)
