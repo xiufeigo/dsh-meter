@@ -114,7 +114,7 @@ MiniMax / Kimi / OpenCode Go / DeepSeek 直接复用「设置 → 模型」里�
 1. 切到 StepFun 模型，圆环会变成 `🔒 绑定`，点它（也可以走 设置 → 内置插件 → 额度仪表）
 2. 展开「**账号密码登录**」，填账号（手机号 / 邮箱）和密码，点「**保存并登录**」
 
-插件直接调控制台自己的 Passport 接口：`RegisterDevice`（匿名设备）→ `SignInByPassword` → 拿到 `Oasis-Token`（一个 JWT）。之后徽章会**解出 JWT 的 `exp`，在过期前 2 分钟自动重登**，整个过程不开浏览器、不弹窗、不连 Edge。密码存在 DSH 凭据库里（和 Cookie 同一个地方），任何接口都不会回传。
+插件直接调控制台自己的 Passport 接口：`RegisterDevice`（匿名设备）→ `SignInByPassword` → 拿到 `Oasis-Token`。之后徽章会**解出 JWT 的 `exp`，在过期前 2 分钟自动续期**——续期走控制台自己的 `RefreshToken`（1 个请求，不传密码、不注册新设备），只有 refresh token 过期（约一个月一次）时才重新账密登录。整个过程不开浏览器、不弹窗、不连 Edge。密码存在 DSH 凭据库里（和 Cookie 同一个地方），任何接口都不会回传。
 
 #### 小米 MiMo：登录一次，profile 记住设备
 
@@ -127,9 +127,9 @@ MiniMax / Kimi / OpenCode Go / DeepSeek 直接复用「设置 → 模型」里�
 #### 自动恢复的顺序（两家通用）
 
 ```
-① 账密重登（StepFun）        ─┐
-② 保活页重落到控制台，重走 SSO  ├─ 全部静默，0 弹窗
-③ 用本地 profile 重启 headless ─┘
+① StepFun：RefreshToken 续期 → 账密重登  ─┐
+② MiMo：保活页重落到控制台，重走 SSO      ├─ 全部静默，0 弹窗
+③ 用本地 profile 重启 headless           ─┘
 ④ 静默连续失败 3 次 → 才弹一次登录窗口（30 分钟内最多一次，账号密码自动填好）
 ⑤ Edge 读取 → 只在你手动点按钮时才连
 ```
@@ -179,8 +179,11 @@ MiniMax / Kimi / OpenCode Go / DeepSeek 直接复用「设置 → 模型」里�
 
 - **控制台登录**用 `--remote-debugging-pipe` 起一个自己控制的 Chromium，通过 DevTools 协议
   （NUL 分隔的 JSON-RPC，走 fd 3/4）读它的 Cookie 罐。不占端口、不需要 Playwright/Puppeteer 之类的依赖。
-- **StepFun 的 token 很短命**，但它是 JWT，而且控制台的 Passport 接口支持账密登录
-  （`RegisterDevice` → `SignInByPassword`）。配了账号密码后，插件解出 `exp`、在到期前主动重登，不开浏览器。
+- **StepFun 的 token 很短命**（30 分钟），但它是 JWT，而且控制台的 Passport 接口支持账密登录
+  （`RegisterDevice` → `SignInByPassword`）。配了账号密码后，插件解出 `exp`、在到期前主动续期：
+  先走控制台自己的 `RefreshToken {}`（带服务端下发的 `Oasis-Token=<access>...<refresh>` 组合 cookie，
+  不传密码、不注册新设备），被拒才重新账密登录。额度接口只认这枚组合 cookie，裸的 access JWT 会被判
+  "token is illegal"；`oasis-token` 请求头一律不发。
 - **MiMo 的 token 靠 SSO 续**：后台保活页停在控制台，token 失效时重新落到控制台首页，小米 SSO 用 profile 里的
   `passToken` 静默换新。保活页每 2 分钟读一次 cookie 罐，即使罐子没变也每 5 分钟向控制台强校验一次——
   服务端作废 token 时本地罐子是不会变的，光看"变没变"会被骗。

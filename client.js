@@ -134,6 +134,7 @@ window.__ModuleLoader__.load({
         accountSaved: 'Saved ✓ {username}',
         accountBound: 'Signed in and bound; the session renews itself',
         accountClear: 'Clear',
+        accountClearConfirm: 'Click again to clear',
         accountCleared: 'Cleared',
         accountEmpty: 'Enter both the username and the password',
         accountShow: 'Username & password',
@@ -231,6 +232,7 @@ window.__ModuleLoader__.load({
         accountSaved: '已保存 ✓ {username}',
         accountBound: '已登录并绑定，会话会自动续期',
         accountClear: '清除',
+        accountClearConfirm: '再点一次确认清除',
         accountCleared: '已清除',
         accountEmpty: '请填写账号和密码',
         accountShow: '账号密码',
@@ -829,6 +831,7 @@ window.__ModuleLoader__.load({
       const [password, setPassword] = React.useState('')
       const [busy, setBusy] = React.useState(false)
       const [message, setMessage] = React.useState(null)
+      const [confirmClear, setConfirmClear] = React.useState(false)
 
       React.useEffect(() => {
         let alive = true
@@ -854,39 +857,49 @@ window.__ModuleLoader__.load({
 
       const save = () => {
         const name = username.trim()
-        if (name.length === 0 || password.length === 0) { setMessage({ error: t('accountEmpty') }); return }
+        if (name.length === 0 || password.length === 0) { setMessage({ kind: 'error', text: t('accountEmpty') }); return }
         setBusy(true)
         setMessage(null)
         post({ username: name, password })
           .then((data) => {
-            setPassword('')
             if (data.status === 'ok') {
               setState({ loaded: true, configured: true, usernameMasked: data.usernameMasked ?? null })
               setOpen(false)
-              setMessage({ ok: data.bound === true ? t('accountBound') : t('accountSaved', { username: data.usernameMasked ?? '' }) })
+              setMessage({
+                kind: 'ok',
+                text: data.bound === true ? t('accountBound') : t('accountSaved', { username: data.usernameMasked ?? '' }),
+              })
               report('account-saved', `${plan.family} bound=${data.bound === true}`)
               if (data.bound === true) onBound()
             } else {
-              setMessage({ error: String(data.message ?? t('autoFailed')) })
+              setMessage({ kind: 'error', text: String(data.message ?? t('autoFailed')) })
             }
           })
-          .catch((error) => setMessage({ error: String(error?.message ?? error) }))
-          .finally(() => setBusy(false))
+          .catch((error) => setMessage({ kind: 'error', text: String(error?.message ?? error) }))
+          .finally(() => { setPassword(''); setBusy(false) })
       }
 
+      // Clearing throws away credentials the user typed in by hand, so the
+      // first click only arms it; a second one within a few seconds confirms.
       const clear = () => {
+        if (confirmClear !== true) {
+          setConfirmClear(true)
+          window.setTimeout(() => setConfirmClear(false), 4000)
+          return
+        }
+        setConfirmClear(false)
         setBusy(true)
         post({ clear: true })
           .then((data) => {
             if (data.status === 'ok') {
               setState({ loaded: true, configured: false, usernameMasked: null })
               setOpen(false)
-              setMessage({ ok: t('accountCleared') })
+              setMessage({ kind: 'ok', text: t('accountCleared') })
             } else {
-              setMessage({ error: String(data.message ?? t('autoFailed')) })
+              setMessage({ kind: 'error', text: String(data.message ?? t('autoFailed')) })
             }
           })
-          .catch((error) => setMessage({ error: String(error?.message ?? error) }))
+          .catch((error) => setMessage({ kind: 'error', text: String(error?.message ?? error) }))
           .finally(() => setBusy(false))
       }
 
@@ -899,7 +912,12 @@ window.__ModuleLoader__.load({
               ? h('span', { className: 'qm-ok' }, t('accountSaved', { username: state.usernameMasked ?? '' }))
               : null,
             state.configured === true
-              ? h('button', { type: 'button', className: 'qm-btn', disabled: busy, onClick: clear }, t('accountClear'))
+              ? h('button', {
+                type: 'button',
+                className: 'qm-btn',
+                disabled: busy,
+                onClick: clear,
+              }, confirmClear ? t('accountClearConfirm') : t('accountClear'))
               : null,
             h('button', { type: 'button', className: 'qm-link', onClick: () => setOpen((value) => !value) },
               open ? t('accountHide') : t('accountShow')),
@@ -930,11 +948,11 @@ window.__ModuleLoader__.load({
               h('div', { className: 'qm-btnrow' },
                 h('button', { type: 'button', className: 'qm-btn qm-primary', disabled: busy, onClick: save },
                   busy ? t('loading') : t('accountSave')),
-                message?.ok === true ? h('span', { className: 'qm-ok' }, message.ok) : null,
-                typeof message?.error === 'string' ? h('span', { className: 'qm-error' }, message.error) : null,
+                message?.kind === 'ok' ? h('span', { className: 'qm-ok' }, message.text) : null,
+                message?.kind === 'error' ? h('span', { className: 'qm-error' }, message.text) : null,
               ),
             )
-          : (message?.ok === true ? h('div', { className: 'qm-ok' }, message.ok) : null),
+          : (message?.kind === 'ok' ? h('div', { className: 'qm-ok' }, message.text) : null),
       )
     }
 

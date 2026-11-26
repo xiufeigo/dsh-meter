@@ -61,14 +61,14 @@ function makeMockHarness ({ providersInherited, providersOverride, envCreds = {}
     },
   }
 
-  async function invoke (routePath, { method = 'GET', query = '', body = undefined } = {}) {
+  async function invoke (routePath, { method = 'GET', query = '', body = undefined, crossSite = false } = {}) {
     const handler = routes.get(routePath)
     assert.ok(handler, `expected route ${routePath} to be registered`)
     const payload = body === undefined ? Buffer.alloc(0) : Buffer.from(JSON.stringify(body), 'utf8')
     const req = Readable.from(payload.length > 0 ? [payload] : [])
     req.method = method
     req.url = `${routePath}${query}`
-    req.headers = { 'sec-fetch-site': 'same-origin' }
+    req.headers = { 'sec-fetch-site': crossSite ? 'cross-site' : 'same-origin' }
 
     let statusCode = 200
     let headers = {}
@@ -165,17 +165,19 @@ try {
       { name: 'serviceToken', value: 'console', domain: 'platform.xiaomimimo.com', path: '/' },
       { name: 'serviceToken', value: 'wide', domain: '.xiaomimimo.com', path: '/' },
       { name: 'pref', value: 'x', domain: 'platform.xiaomimimo.com', path: '/api/' },
+      { name: 'v1', value: 'y', domain: 'platform.xiaomimimo.com', path: '/api/v1' },
       { name: 'consoleOnly', value: 'z', domain: 'platform.xiaomimimo.com', path: '/console' },
       { name: 'unrelated', value: 'y', domain: 'example.com', path: '/' },
     ]
     // Seeding a profile keeps every related cookie, one per (domain, path, name).
     const all = internals.pickConsoleCookies(cookies, ['xiaomimimo.com', 'xiaomi.com', 'mi.com'])
-    assert.equal(all.length, 6)
+    assert.equal(all.length, 7)
     assert.equal(all.filter((c) => c.name === 'serviceToken').length, 3)
-    // The API host only ever sees what a browser would send it for /api/:
-    // host-only and domain cookies that match, longer paths first.
+    // The API host only ever sees what a browser would send it for its usage
+    // endpoints (/api/v1/…): host-only and domain cookies that match, longer
+    // paths first; a cookie scoped to another path stays home.
     const header = internals.consoleCookieHeader('mimo', cookies)
-    assert.equal(header, 'pref=x; serviceToken=console; serviceToken=wide')
+    assert.equal(header, 'v1=y; pref=x; serviceToken=console; serviceToken=wide')
     assert.equal(internals.consoleCookieHeader('stepfun', [
       { name: 'Oasis-Token', value: 'sso', domain: 'account.stepfun.com', path: '/' },
       { name: 'Oasis-Token', value: 'api', domain: 'platform.stepfun.com', path: '/' },
@@ -205,6 +207,13 @@ try {
       { name: 'Oasis-Token', value: 'a=b=c' },
     ])
     assert.deepEqual(internals.parseSetCookies({ get: () => 'Oasis-Webid=w1; Path=/' }), [{ name: 'Oasis-Webid', value: 'w1' }])
+    // A runtime without getSetCookie() joins cookies with commas; an Expires
+    // date contains one too and must stay inside its cookie.
+    assert.deepEqual(internals.parseSetCookies({ get: () => 'A=1; Path=/; Expires=Wed, 21 Oct 2026 07:28:00 GMT, B=x=y; Path=/, C=3' }), [
+      { name: 'A', value: '1' },
+      { name: 'B', value: 'x=y' },
+      { name: 'C', value: '3' },
+    ])
     assert.deepEqual(internals.parseSetCookies(undefined), [])
     assert.equal(internals.maskAccount('13812345678'), '138****78')
     assert.equal(internals.maskAccount('someone@example.com'), 's***@example.com')
@@ -215,6 +224,7 @@ try {
   // ── shared mock HTTP upstream ─────────────────────────────────────────
   const fetchCalls = []
   const passportCalls = []
+  const refreshCalls = []
   let plainProxyBillingReady = false
   let stepfunTokenSeconds = 1800
   globalThis.fetch = makeMockFetch(async (url, init) => {
@@ -254,6 +264,28 @@ try {
         status: 200,
         setCookies: [`Oasis-Token=${fakeJwt(stepfunTokenSeconds)}...rt; Path=/; Max-Age=25920000; HttpOnly`],
         data: { accessToken: { raw: fakeJwt(stepfunTokenSeconds), duration: stepfunTokenSeconds, mode: 'SIGN_IN' }, refreshToken: { raw: 'rt' } },
+      }
+    }
+    if (url === 'https://platform.stepfun.com/passport/proto.api.passport.v1.PassportService/RefreshToken') {
+      refreshCalls.push({ body: init?.body, headers: init?.headers, cookie })
+      // The console's own renewal: an empty body plus the server's combined
+      // cookie; a retired refresh is declined, a bare JWT is not a session.
+      assert.equal(init?.headers?.['oasis-token'], undefined)
+      assert.equal(init?.headers?.['oasis-webid'], 'w')
+      assert.equal(init.body, '{}')
+      const token = decodeURIComponent(/Oasis-Token=([^;]+)/.exec(cookie)?.[1] ?? '')
+      let sub = ''
+      try {
+        sub = String(JSON.parse(Buffer.from(token.split('...')[0].split('.')[1], 'base64url').toString('utf8')).sub ?? '')
+      } catch { sub = '' }
+      if (!token.includes('...') || sub.startsWith('retired')) {
+        return { status: 401, data: { code: 'unauthenticated', message: 'token is illegal' } }
+      }
+      const jwt = fakeJwt(stepfunTokenSeconds, sub || 'user-1')
+      return {
+        status: 200,
+        setCookies: [`Oasis-Token=${jwt}...rt-new; Path=/; Max-Age=25920000; HttpOnly`, 'Oasis-Webid=dev-server-1; Path=/; HttpOnly'],
+        data: { accessToken: { raw: jwt, duration: stepfunTokenSeconds, mode: 2 }, refreshToken: { raw: 'rt-new' } },
       }
     }
     if (url === 'https://platform.stepfun.com/api/step.openapi.devcenter.Dashboard/QueryStepPlanRateLimit') {
@@ -484,23 +516,38 @@ try {
   assert.ok(signIn.cookie.includes('Oasis-Token=anon-token...rt-anon'))
   assert.ok(!/Oasis-Token=anon-token(;|$)/.test(signIn.cookie))
   const wsAfterLogin = wsConnections
+  const signIns = () => passportCalls.filter((c) => c.method === 'SignInByPassword').length
 
-  // A JWT about to retire is renewed proactively, before any 401.
+  // `/raw` shows what the console answered — never the cookies it set in reply.
+  for (const query of ['?family=stepfun&provider=stepfun', '?family=mimo&provider=xiaomi-token-plan-cn']) {
+    const raw = await h1.invoke('/plugins/dsh-meter/raw', { query })
+    assert.equal(raw.statusCode, 200, `${query}: ${raw.rawBody}`)
+    assert.equal(raw.rawBody.includes('setCookies'), false, `${query}: /raw must not expose upstream Set-Cookie values`)
+    assert.equal(raw.rawBody.includes('Oasis-Token='), false, `${query}: /raw must not expose session tokens`)
+  }
+  const crossSiteRaw = await h1.invoke('/plugins/dsh-meter/raw', { query: '?family=stepfun', crossSite: true })
+  assert.equal(crossSiteRaw.statusCode, 403)
+
+  // A JWT about to retire is renewed proactively — through the console's own
+  // RefreshToken exchange: no password, no new device.
   h1.credMap.set('STEPFUN_COOKIE', `Oasis-Webid=w; Oasis-Token=${fakeJwt(30)}...rt`)
   stepfunTokenSeconds = 1800
   const renewed = await h1.invoke('/plugins/dsh-meter/quota', { query: '?provider=stepfun&model=step-5' })
   assert.equal(renewed.json.status, 'ok')
-  assert.equal(passportCalls.filter((c) => c.method === 'SignInByPassword').length, 3)
+  assert.equal(signIns(), 2, 'a token refresh signs nobody in again')
+  assert.equal(refreshCalls.length, 1)
   assert.ok(!h1.credMap.get('STEPFUN_COOKIE').includes(fakeJwt(30).split('.')[1]), 'stale JWT replaced')
-  assert.ok(h1.credMap.get('STEPFUN_COOKIE').endsWith('...rt'), 'renewal keeps the combined cookie shape')
+  assert.ok(h1.credMap.get('STEPFUN_COOKIE').includes('...rt-new'), 'renewal keeps the combined cookie shape')
 
-  // A token the console rejects (still unexpired) is replaced silently on 401.
+  // A session the console retired is declined by the refresh too; the stored
+  // password brings it back silently on 401.
   h1.credMap.set('STEPFUN_COOKIE', `Oasis-Webid=w; Oasis-Token=${fakeJwt(3600, 'retired')}...rt`)
   const recovered = await h1.invoke('/plugins/dsh-meter/quota', { query: '?provider=stepfun&model=step-5' })
   assert.equal(recovered.json.status, 'ok')
   assert.equal(recovered.json.loginWindow, undefined)
-  assert.equal(passportCalls.filter((c) => c.method === 'SignInByPassword').length, 4)
-  assert.equal(wsConnections, wsAfterLogin, 'password recovery never touches Edge')
+  assert.equal(signIns(), 3)
+  assert.equal(refreshCalls.length, 2)
+  assert.equal(wsConnections, wsAfterLogin, 'recovery never touches Edge')
 
   // Wrong password later: the error is surfaced as the first of several
   // silent rounds, the ladder backs off, and still no Edge and no window.
@@ -514,11 +561,14 @@ try {
   assert.ok(failedRecover.json.message.includes('password is wrong'))
   assert.ok(failedRecover.json.retryAfter > 0)
   assert.equal(wsConnections, wsAfterLogin)
-  // While backing off, a poll does not try the password again.
+  assert.equal(signIns(), 4)
+  assert.equal(refreshCalls.length, 3)
+  // While backing off, a poll tries neither the refresh nor the password again.
   const duringBackoff = await h1.invoke('/plugins/dsh-meter/quota', { query: '?provider=stepfun&model=step-5' })
   assert.equal(duringBackoff.json.status, 'no-credential')
   assert.ok(duringBackoff.json.message.includes('第 1/3 次'))
-  assert.equal(passportCalls.filter((c) => c.method === 'SignInByPassword').length, 5)
+  assert.equal(signIns(), 4)
+  assert.equal(refreshCalls.length, 3)
   // Clearing the account reports "not configured" and never returns secrets.
   const cleared = await h1.invoke('/plugins/dsh-meter/account', {
     method: 'POST', query: '?family=stepfun', body: { clear: true },

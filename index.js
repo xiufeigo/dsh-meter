@@ -214,12 +214,17 @@ async function fetchJson(url, { method = 'GET', headers = {}, body, timeoutMs = 
   return { status: response.status, ok: response.ok, data, setCookies: parseSetCookies(response.headers) }
 }
 
-/** `Set-Cookie` lines as plain `{ name, value }` pairs: all a cookie jar needs here. */
+/**
+ * `Set-Cookie` lines as plain `{ name, value }` pairs: all a cookie jar needs
+ * here. Runtimes without `getSetCookie()` hand back one comma-joined string;
+ * a comma only starts a new cookie when a `name=` follows it, which keeps
+ * `Expires=Wed, 21 Oct …` in one piece.
+ */
 function parseSetCookies(headers) {
   if (headers === undefined || headers === null) return []
   const lines = typeof headers.getSetCookie === 'function'
     ? headers.getSetCookie()
-    : [headers.get?.('set-cookie') ?? '']
+    : String(headers.get?.('set-cookie') ?? '').split(/,(?=\s*[^\s;,=]+=[^;,]*)/)
   const out = []
   for (const line of lines) {
     const match = /^\s*([^\s=;]+)=([^;]*)/.exec(String(line ?? ''))
@@ -558,14 +563,16 @@ const LOGIN_TARGETS = {
     // sibling hosts (an SSO app on account.stepfun.com) are kept for seeding a
     // browser profile, but never sent to this host — a browser would not either.
     apiHost: 'platform.stepfun.com',
-    apiPath: '/api/',
+    // The usage endpoints live under this path; a cookie scoped narrower than
+    // this (say /console) must not reach them, one scoped to it must.
+    apiPath: '/api/step.openapi.devcenter.Dashboard/',
     label: 'StepFun',
   },
   mimo: {
     loginUrl: 'https://platform.xiaomimimo.com/',
     domains: ['xiaomimimo.com', 'xiaomi.com', 'mi.com'],
     apiHost: 'platform.xiaomimimo.com',
-    apiPath: '/api/',
+    apiPath: '/api/v1/',
     label: 'MiMo',
   },
 }
@@ -600,6 +607,9 @@ const KEEPALIVE_FIRST_TICK_MS = 4_000
 // An unchanged jar proves nothing: the server may have retired the token while
 // the parked page sat idle. Re-validate at this interval regardless.
 const KEEPALIVE_REVALIDATE_MS = 5 * 60_000
+// Within a reload loop, the same unchanged jar goes back to the console at
+// most this often.
+const KEEPALIVE_RECHECK_MS = 5_000
 // Silent recovery (password re-login, parked page reload, headless restart)
 // is free; a visible login window is not. It opens only after this many
 // silent rounds have failed in a row, and at most this often.
@@ -1032,11 +1042,19 @@ function createPipeClient(child) {
   }
 }
 
+// Chromium holds its profile directory until it has fully exited. A browser
+// closed a moment ago (the login window that just bound) needs a moment before
+// another may open the same profile.
+const profileReleasedAt = new Map()
+const PROFILE_RELEASE_GRACE_MS = 2_000
+
 async function openBrowserPage({ headless, profileDir, url, seedCookies = [] }) {
   const browserPath = findBrowser()
   if (browserPath === null) {
     throw httpError(500, 'no Chromium browser found — install Chrome or Edge, or set DSH_QUOTA_BROWSER to its executable')
   }
+  const remaining = PROFILE_RELEASE_GRACE_MS - (Date.now() - (profileReleasedAt.get(profileDir) ?? 0))
+  if (remaining > 0) await new Promise((resolve) => setTimeout(resolve, remaining))
   fs.mkdirSync(profileDir, { recursive: true })
   const child = spawn(browserPath, [
     '--remote-debugging-pipe',
@@ -1060,6 +1078,7 @@ async function openBrowserPage({ headless, profileDir, url, seedCookies = [] }) 
 
   let cdp = null
   const stop = () => {
+    profileReleasedAt.set(profileDir, Date.now())
     // A polite Browser.close lets Chromium flush its cookie store to disk;
     // fall back to kill if the process does not exit quickly.
     try { cdp?.send('Browser.close').catch(() => {}) } catch { /* pipe already dead */ }
@@ -1565,24 +1584,86 @@ async function stepfunPasswordLogin(username, password) {
     error.authRejected = true
     throw error
   }
-  // The signed-in session is whatever the server handed back, kept verbatim:
-  // its Oasis-Token cookie is "<access>...<refresh>" (HttpOnly, so a real
-  // browser's own cookie write never replaces it), and the usage API insists
-  // on exactly that shape — a bare access JWT there draws "token is illegal".
-  // The access JWT is still what tells us when the session retires.
-  if (!jar.has('Oasis-Token')) {
-    const refresh = signed.data?.refreshToken?.raw ?? signed.data?.refresh_token?.raw
-    jar.set('Oasis-Token', typeof refresh === 'string' && refresh.length > 0 ? `${access.raw}...${refresh}` : access.raw)
+  // Only a cookie the sign-in response itself set may stand for the signed-in
+  // session — the jar still holds the anonymous one from registration. The
+  // usage API insists on the "<access>...<refresh>" shape and rejects a bare
+  // access JWT as an illegal token, so without either source there is no
+  // session to bind.
+  const signedCookies = new Map((signed.setCookies ?? []).map(({ name, value }) => [name, value]))
+  if (signedCookies.has('Oasis-Token')) {
+    jar.set('Oasis-Token', signedCookies.get('Oasis-Token'))
+  } else {
+    const refresh = stepfunRefreshToken(signed.data)
+    if (refresh === null) {
+      throw httpError(502, 'StepFun sign-in returned no session cookie — this session cannot be bound')
+    }
+    jar.set('Oasis-Token', `${access.raw}...${refresh}`)
   }
   if (!jar.has('Oasis-Webid')) jar.set('Oasis-Webid', webid)
-  // Stable, browser-like order: routing cookie, identity, token, the rest.
+  return {
+    header: stepfunJarHeader(jar),
+    webid,
+    expiresAt: jwtExpiryMs(access.raw) ?? (access.duration !== null ? Date.now() + access.duration * 1000 : null),
+    duration: access.duration,
+  }
+}
+
+function stepfunRefreshToken(data) {
+  const raw = data?.refreshToken?.raw ?? data?.refresh_token?.raw
+  return typeof raw === 'string' && raw.length > 0 ? raw : null
+}
+
+/** A cookie jar as a request header, in a stable browser-like order. */
+function stepfunJarHeader(jar) {
   const priority = ['INGRESSCOOKIE', 'Oasis-Webid', 'Oasis-Token']
   const ordered = priority.filter((name) => jar.has(name))
     .concat([...jar.keys()].filter((name) => !priority.includes(name)))
-  const cookieHeaderValue = ordered.map((name) => `${name}=${jar.get(name)}`).join('; ')
+  return ordered.map((name) => `${name}=${jar.get(name)}`).join('; ')
+}
+
+function cookieHeaderToJar(header) {
+  const jar = new Map()
+  for (const part of String(header ?? '').split(';')) {
+    const eq = part.indexOf('=')
+    if (eq <= 0) continue
+    const name = part.slice(0, eq).trim()
+    if (name.length > 0) jar.set(name, part.slice(eq + 1).trim())
+  }
+  return jar
+}
+
+/**
+ * Renew a StepFun session the way the console does: an empty RefreshToken
+ * call carrying the server's cookies answers a fresh access token and re-sets
+ * the session cookie. No password, no new device. Returns null when the
+ * server declines — its refresh token retires after about a month — in which
+ * case only a password sign-in can bring the session back.
+ */
+async function stepfunRefresh(cookieHeader) {
+  if (cookieValueOf(cookieHeader, 'Oasis-Token') === null) return null
+  const jar = cookieHeaderToJar(cookieHeader)
+  const webid = decodeURIComponent(jar.get('Oasis-Webid') ?? '')
+  let refreshed = null
+  try {
+    refreshed = await fetchJson(`${STEPFUN_PASSPORT}/RefreshToken`, {
+      method: 'POST',
+      headers: stepfunPassportHeaders(stepfunJarHeader(jar), { webid }),
+      body: '{}',
+      attempts: 1,
+    })
+  } catch {
+    return null
+  }
+  const access = stepfunAccessToken(refreshed.data)
+  if (!refreshed.ok || access.raw === null) return null
+  for (const { name, value } of refreshed.setCookies ?? []) jar.set(name, value)
+  if (!(refreshed.setCookies ?? []).some(({ name }) => name === 'Oasis-Token')) {
+    const refresh = stepfunRefreshToken(refreshed.data)
+    if (refresh === null) return null
+    jar.set('Oasis-Token', `${access.raw}...${refresh}`)
+  }
   return {
-    header: cookieHeaderValue,
-    webid,
+    header: stepfunJarHeader(jar),
     expiresAt: jwtExpiryMs(access.raw) ?? (access.duration !== null ? Date.now() + access.duration * 1000 : null),
     duration: access.duration,
   }
@@ -1923,14 +2004,22 @@ export function apply(ctx, config = {}) {
   const headlessRefreshInflight = new Map()
   const edgeSyncInflight = new Map()
   // Recovery bookkeeping per console family: `failures` / `lastFailAt` drive
-  // the exponential backoff (any successful bind resets them), `lastWindowAt`
-  // gates the visible login window. `accountCache` mirrors the credential
-  // store's answer so synchronous code can ask "is a password configured?".
+  // the exponential backoff (any successful bind resets them). The window
+  // cooldown lives apart from that, because a bind must not re-arm the window.
+  // `accountCache` mirrors the credential store's answer so synchronous code
+  // can ask "is a password configured?".
   const recoverState = new Map()
-  const loginInflight = new Map()
+  const lastLoginWindowAt = new Map()
+  const renewInflight = new Map()
+  const recoverInflight = new Map()
+  // One parked-browser launch per family at a time, and how often it has been
+  // asked to stop (a launch that is still in flight must honour a later stop).
+  const keepAliveStarting = new Map()
+  const keepAliveStops = new Map()
   const accountCache = new Map()
   const lastLoginError = new Map()
   const lastLoginFailedAt = new Map()
+  const lastRefreshFailedAt = new Map()
   const runtimeConsoleCookies = new Map()
 
   const GATEWAY_POS_TTL_MS = 30 * 60_000
@@ -1956,6 +2045,7 @@ export function apply(ctx, config = {}) {
     recoverState.delete(family)
     lastLoginError.delete(family)
     lastLoginFailedAt.delete(family)
+    lastRefreshFailedAt.delete(family)
     cache.clear()
   }
 
@@ -1966,6 +2056,7 @@ export function apply(ctx, config = {}) {
   // own front end keep the session fresh; we only re-read the jar.
 
   async function stopKeepAlive(family) {
+    keepAliveStops.set(family, (keepAliveStops.get(family) ?? 0) + 1)
     const entry = KEEPALIVE.get(family)
     if (entry === undefined) return
     KEEPALIVE.delete(family)
@@ -1988,10 +2079,12 @@ export function apply(ctx, config = {}) {
       if (header.length === 0) return false
       const now = Date.now()
       const unchanged = header === entry.lastHeader
-      // An unchanged jar is only trusted for a while: the server may have
-      // retired the token while the parked page sat idle.
-      if (!force && unchanged && now - (entry.lastValidatedAt ?? 0) < KEEPALIVE_REVALIDATE_MS) return entry.ok
+      // An unchanged jar is not asked about again for a while: the console
+      // has just ruled on it either way, and a page mid-sign-in needs time.
+      if (unchanged && !force && now - (entry.lastAttemptAt ?? 0) < KEEPALIVE_REVALIDATE_MS) return entry.ok
+      if (unchanged && force && now - (entry.lastAttemptAt ?? 0) < KEEPALIVE_RECHECK_MS) return false
       entry.lastHeader = header
+      entry.lastAttemptAt = now
       try {
         await queryUncached(family, header)
         await saveConsoleCookie(family, header, cookies)
@@ -2057,11 +2150,23 @@ export function apply(ctx, config = {}) {
       : 15_000
   }
 
-  async function startKeepAlive(family, { extraSeedCookies = [], allowUnbound = false } = {}) {
-    if (KEEPALIVE.has(family)) return
+  // One launch per family at a time: two callers racing past `KEEPALIVE.has`
+  // would open two browsers on one profile and lose track of the first.
+  function startKeepAlive(family, options = {}) {
+    if (KEEPALIVE.has(family)) return Promise.resolve()
+    const running = keepAliveStarting.get(family)
+    if (running !== undefined) return running
+    const promise = launchKeepAlive(family, options).finally(() => {
+      keepAliveStarting.delete(family)
+    })
+    keepAliveStarting.set(family, promise)
+    return promise
+  }
+
+  async function launchKeepAlive(family, { extraSeedCookies = [], allowUnbound = false } = {}) {
     const target = LOGIN_TARGETS[family]
     if (target === undefined) return
-    // A StepFun password signs in over HTTP; parking a browser for it would
+    // A StepFun session is renewed over HTTP; parking a browser for it would
     // only duplicate that work (and fight it over the same account).
     if (family === 'stepfun' && extraSeedCookies.length === 0 && accountCache.get('stepfun') != null) return
     const profileDir = profileDirFor(family, dataDir)
@@ -2070,10 +2175,17 @@ export function apply(ctx, config = {}) {
     const seedCookies = extraSeedCookies.length > 0
       ? mergeCookieLists(baseCookies, extraSeedCookies)
       : baseCookies
+    const stopsAtLaunch = keepAliveStops.get(family) ?? 0
     let page = null
     try {
       page = await openBrowserPage({ headless: true, profileDir, url: target.loginUrl, seedCookies })
     } catch {
+      return
+    }
+    // Asked to stop while launching (a login window wants this profile): do
+    // not park a browser nobody is tracking.
+    if ((keepAliveStops.get(family) ?? 0) !== stopsAtLaunch || KEEPALIVE.has(family)) {
+      page.stop()
       return
     }
     const entry = {
@@ -2087,6 +2199,7 @@ export function apply(ctx, config = {}) {
       failures: 0,
       startedAt: Date.now(),
       lastValidatedAt: 0,
+      lastAttemptAt: 0,
       // openBrowserPage just landed on the console; count that as the first
       // "reload" so a validation right after does not navigate a second time.
       lastReloadAt: Date.now(),
@@ -2216,11 +2329,6 @@ export function apply(ctx, config = {}) {
     return account
   }
 
-  async function accountConfigured(family) {
-    if (!accountCache.has(family)) await accountFor(family).catch(() => null)
-    return accountCache.get(family) != null
-  }
-
   /** Cookie objects for a StepFun session header, on the host the API lives on. */
   function stepfunSessionCookies(header) {
     return ['INGRESSCOOKIE', 'Oasis-Webid', 'Oasis-Token'].flatMap((name) => {
@@ -2231,30 +2339,71 @@ export function apply(ctx, config = {}) {
     })
   }
 
-  /** Sign in to StepFun again with the stored username + password. */
-  async function stepfunRelogin() {
-    const running = loginInflight.get('stepfun')
+  /** Store a StepFun session header, plus the cookies it names, for a profile. */
+  async function persistStepfunSession(header) {
+    const dir = profileDirFor('stepfun', dataDir)
+    const replaced = new Set(['INGRESSCOOKIE', 'Oasis-Webid', 'Oasis-Token'])
+    const kept = loadJarCookies(dir).filter((cookie) => !replaced.has(cookie.name))
+    await saveConsoleCookie('stepfun', header, mergeCookieLists(kept, stepfunSessionCookies(header)))
+  }
+
+  /** The password rung on its own; callers provide the single-flight guard. */
+  async function stepfunPasswordSignInUnchecked() {
+    const account = await accountFor('stepfun').catch(() => null)
+    if (account === null) return false
+    if (Date.now() - (lastLoginFailedAt.get('stepfun') ?? 0) < 30_000) return false
+    try {
+      const result = await stepfunPasswordLogin(account.username, account.password)
+      await persistStepfunSession(result.header)
+      lastLoginError.delete('stepfun')
+      lastLoginFailedAt.delete('stepfun')
+      lastRefreshFailedAt.delete('stepfun')
+      return true
+    } catch (error) {
+      lastLoginError.set('stepfun', String(error?.message ?? error))
+      lastLoginFailedAt.set('stepfun', Date.now())
+      return false
+    }
+  }
+
+  /**
+   * Bring the StepFun session back without bothering anyone, exactly as the
+   * console does: first its own RefreshToken exchange on the stored cookies
+   * (no password, no new device), and only when the server declines that —
+   * its refresh token retires after about a month — the stored username and
+   * password. Each rung has a short cooldown after a failure, so a poll every
+   * few minutes cannot turn into a storm of registrations or passwords.
+   */
+  async function stepfunRenew() {
+    const running = renewInflight.get('stepfun')
     if (running !== undefined) return running
     const promise = (async () => {
-      const account = await accountFor('stepfun')
-      if (account === null) return false
-      const dir = profileDirFor('stepfun', dataDir)
-      try {
-        const result = await stepfunPasswordLogin(account.username, account.password)
-        const replaced = new Set(['INGRESSCOOKIE', 'Oasis-Webid', 'Oasis-Token'])
-        const kept = loadJarCookies(dir).filter((cookie) => !replaced.has(cookie.name))
-        await saveConsoleCookie('stepfun', result.header, mergeCookieLists(kept, stepfunSessionCookies(result.header)))
-        lastLoginFailedAt.delete('stepfun')
-        return true
-      } catch (error) {
-        lastLoginError.set('stepfun', String(error?.message ?? error))
-        lastLoginFailedAt.set('stepfun', Date.now())
-        return false
+      const current = await secretFor('stepfun', {}, '').catch(() => null)
+      if (current !== null && Date.now() - (lastRefreshFailedAt.get('stepfun') ?? 0) >= 60_000) {
+        const refreshed = await stepfunRefresh(current).catch(() => null)
+        if (refreshed !== null) {
+          await persistStepfunSession(refreshed.header)
+          lastRefreshFailedAt.delete('stepfun')
+          return true
+        }
+        lastRefreshFailedAt.set('stepfun', Date.now())
       }
+      return await stepfunPasswordSignInUnchecked()
     })().finally(() => {
-      loginInflight.delete('stepfun')
+      renewInflight.delete('stepfun')
     })
-    loginInflight.set('stepfun', promise)
+    renewInflight.set('stepfun', promise)
+    return promise
+  }
+
+  /** Prove the stored credentials with a password sign-in (single flight). */
+  async function stepfunPasswordSignIn() {
+    const running = renewInflight.get('stepfun')
+    if (running !== undefined) await running.catch(() => false)
+    const promise = stepfunPasswordSignInUnchecked().finally(() => {
+      renewInflight.delete('stepfun')
+    })
+    renewInflight.set('stepfun', promise)
     return promise
   }
 
@@ -2263,7 +2412,7 @@ export function apply(ctx, config = {}) {
   function recoverBackoff(family) {
     let state = recoverState.get(family)
     if (state === undefined) {
-      state = { failures: 0, lastFailAt: 0, lastWindowAt: 0 }
+      state = { failures: 0, lastFailAt: 0 }
       recoverState.set(family, state)
     }
     return state
@@ -2295,14 +2444,28 @@ export function apply(ctx, config = {}) {
 
   /**
    * A console family's saved session was rejected. Climb the silent rungs
-   * first — password sign-in (StepFun), then the parked browser re-landing on
-   * the console so its own front end re-runs the sign-in round trip. Only when
-   * `silentFailuresBeforeWindow` rounds have failed in a row does a visible
-   * login window open, at most twice an hour, with a stored username + password
-   * typed in ahead of time (MiMo may still ask for an SMS code, which only the
-   * user can read). Edge is never touched here; it stays a manual button.
+   * first — for StepFun a token refresh or a password sign-in over HTTP, for
+   * the others the parked browser re-landing on the console so its own front
+   * end re-runs the sign-in round trip. Only when `silentFailuresBeforeWindow`
+   * rounds have failed in a row does a visible login window open, at most
+   * twice an hour, with a stored username + password typed in ahead of time
+   * (MiMo may still ask for an SMS code, which only the user can read). Edge
+   * is never touched here; it stays a manual button.
    */
   async function recoverConsoleSession(family, { allowWindow = true } = {}) {
+    // One round per family at a time. Several providers share a console
+    // family (every Xiaomi route is MiMo); concurrent callers must share one
+    // round rather than each count it as a failure of its own.
+    const running = recoverInflight.get(family)
+    if (running !== undefined) return running
+    const promise = recoverConsoleRound(family, { allowWindow }).finally(() => {
+      recoverInflight.delete(family)
+    })
+    recoverInflight.set(family, promise)
+    return promise
+  }
+
+  async function recoverConsoleRound(family, { allowWindow }) {
     const failureCount = () => recoverState.get(family)?.failures ?? 0
     // A login window is already open for this family: it holds the profile
     // and the badge is watching it, so there is nothing to do until it ends.
@@ -2314,18 +2477,17 @@ export function apply(ctx, config = {}) {
     if (blocked > 0) return { recovered: false, retryAfter: blocked, failures: failureCount() }
     const state = recoverBackoff(family)
     const account = await accountFor(family).catch(() => null)
-    // For StepFun a stored password is the silent path: no browser can help
-    // (its profile holds no SSO cookie to re-exchange), so none is launched.
-    const passwordIsTheSilentPath = family === 'stepfun' && account !== null
-    // Rung 1: password sign-in. A rejection from the last moments is still
-    // fresh; do not hammer the passport service.
+    // For StepFun the stored credentials are the silent path (a token refresh,
+    // else a password sign-in): no browser can help, since its profile holds
+    // no SSO cookie to re-exchange, so none is launched.
+    const credentialsAreTheSilentPath = family === 'stepfun'
+    // Rung 1: refresh / password sign-in over HTTP, each with its own cooldown.
     let via = null
-    if (passwordIsTheSilentPath) {
-      const lastLoginFailedAgo = Date.now() - (lastLoginFailedAt.get(family) ?? 0)
-      if (lastLoginFailedAgo >= 30_000 && await stepfunRelogin().catch(() => false)) via = 'password'
+    if (credentialsAreTheSilentPath) {
+      if (await stepfunRenew().catch(() => false)) via = 'http'
     }
     // Rung 2: the parked browser re-lands on the console.
-    if (via === null && config.disableAutoKeepAlive !== true && !passwordIsTheSilentPath) {
+    if (via === null && config.disableAutoKeepAlive !== true && !credentialsAreTheSilentPath) {
       const entry = KEEPALIVE.get(family)
       const ok = entry !== undefined
         ? await reloadAndValidate(family, entry, headlessRefreshMaxWait()).catch(() => false)
@@ -2340,14 +2502,16 @@ export function apply(ctx, config = {}) {
       return { recovered: true, via, retryAfter: 0, failures: 0 }
     }
     // Every silent rung failed: count the round, back off, and only after
-    // several in a row ask the user with a visible window.
+    // several in a row ask the user with a visible window. Its cooldown is
+    // kept apart from the round counter, which any bind resets.
     state.failures += 1
     state.lastFailAt = Date.now()
     const failures = state.failures
+    const lastWindowAt = lastLoginWindowAt.get(family) ?? 0
     if (allowWindow && config.disableAutoLoginWindow !== true
       && failures >= silentFailuresBeforeWindow()
-      && Date.now() - state.lastWindowAt >= AUTO_LOGIN_WINDOW_GAP_MS) {
-      state.lastWindowAt = Date.now()
+      && Date.now() - lastWindowAt >= AUTO_LOGIN_WINDOW_GAP_MS) {
+      lastLoginWindowAt.set(family, Date.now())
       startLoginSession(family, { skipHeadless: true, autofill: account })
       return { recovered: false, via: 'window', window: 'opened', retryAfter: 0, failures }
     }
@@ -2709,11 +2873,12 @@ export function apply(ctx, config = {}) {
 
     let secret = await secretFor(family, row, provider)
     // StepFun: the session is a JWT; renew it just before it retires instead
-    // of waiting for the console to reject it.
+    // of waiting for the console to reject it (a token refresh first, a
+    // password sign-in only when that is declined).
     if (family === 'stepfun' && secret !== null) {
       const expiry = stepfunTokenExpiryMs(secret)
       if (expiry !== null && expiry - Date.now() < STEPFUN_TOKEN_RENEW_SKEW_MS) {
-        if (await stepfunRelogin().catch(() => false)) secret = await secretFor(family, row, provider)
+        if (await stepfunRenew().catch(() => false)) secret = await secretFor(family, row, provider)
       }
     }
     let recovery = { recovered: false, retryAfter: 0, failures: 0 }
@@ -2835,20 +3000,18 @@ export function apply(ctx, config = {}) {
   // ── browser login capture (session runner) ──────────────────────────
 
   /**
-   * Watch one browser's cookie jar until it passes the console check, then
-   * store it. Returns true once bound.
-   */
-  /**
    * Keep typing the stored credentials into whatever sign-in form the page
-   * shows until the session binds, is cancelled, or runs out of time. Runs
-   * beside the capture loop; the loop is what decides when we are done.
+   * shows until it has been submitted once, the session binds, is cancelled,
+   * or runs out of time. Runs beside the capture loop; that loop is what
+   * decides when we are done.
    */
   async function autofillLogin(session, page, account, deadline) {
     const expression = loginAutofillExpression(account.username, account.password)
+    const active = () => !session.cancelled && (session.phase === 'waiting' || session.phase === 'checking')
     session.autofill = true
     session.message = '已打开登录窗口，正在自动填写账号密码…'
     session.updatedAt = Date.now()
-    while (Date.now() < deadline && !session.cancelled && session.phase !== 'bound') {
+    while (Date.now() < deadline && active()) {
       let value = null
       try {
         const result = await page.cdp.send('Runtime.evaluate', { expression, returnByValue: true }, page.sessionId)
@@ -2862,11 +3025,20 @@ export function apply(ctx, config = {}) {
           ? '已自动填写账号密码，请在窗口里输入验证码…'
           : '已打开登录窗口，正在自动填写账号密码…'
       if (session.message !== message) { session.message = message; session.updatedAt = Date.now() }
+      // The form has been sent once. From here the page is the user's: a
+      // rejected password must not be resubmitted until the account locks.
+      if (value === 'submitted') return
       await new Promise((resolve) => setTimeout(resolve, 1_500))
     }
   }
 
+  /**
+   * Watch one browser's cookie jar until it passes the console check, then
+   * store it. Returns true once bound; a launch failure leaves the session
+   * in its `error` phase with the reason.
+   */
   async function captureOnce(session, target, profileDir, { headless, deadline, seedCookies = [], autofill = null }) {
+    if (session.cancelled) return false
     session.phase = headless ? 'checking' : 'waiting'
     session.message = headless ? '检查已保存的登录状态…' : '等待你在浏览器里登录…'
     session.updatedAt = Date.now()
@@ -2874,7 +3046,11 @@ export function apply(ctx, config = {}) {
     try {
       page = await openBrowserPage({ headless, profileDir, url: target.loginUrl, seedCookies })
     } catch (error) {
+      // Say what went wrong now, instead of reporting a timeout later.
       session.lastError = String(error?.message ?? error)
+      session.phase = 'error'
+      session.message = `无法启动浏览器：${session.lastError}`
+      session.updatedAt = Date.now()
       return false
     }
     session.browserPath = page.browserPath
@@ -2942,6 +3118,8 @@ export function apply(ctx, config = {}) {
           return
         }
         if (session.cancelled) { session.phase = 'cancelled'; session.message = '已取消'; return }
+        // The browser could not be launched at all: keep that reason.
+        if (session.phase === 'error') return
       }
       const autofill = session.autofillAccount ?? await accountFor(session.family).catch(() => null)
       session.phase = 'waiting'
@@ -2955,6 +3133,7 @@ export function apply(ctx, config = {}) {
         return
       }
       if (session.cancelled) { session.phase = 'cancelled'; session.message = '已取消' }
+      else if (session.phase === 'error') { /* the launch failure is the message */ }
       else { session.phase = 'timeout'; session.message = '等待超时，请重试' }
     } catch (error) {
       session.phase = 'error'
@@ -3176,6 +3355,8 @@ document.getElementById('save').onclick = async () => {
             }
             accountCache.set(family, null)
             lastLoginError.delete(family)
+            lastLoginFailedAt.delete(family)
+            lastRefreshFailedAt.delete(family)
             return json(res, 200, { status: 'ok', family, configured: false })
           }
           const username = String(body?.username ?? '').trim()
@@ -3190,28 +3371,48 @@ document.getElementById('save').onclick = async () => {
           accountCache.set(family, { username, password })
           lastLoginError.delete(family)
           lastLoginFailedAt.delete(family)
+          lastRefreshFailedAt.delete(family)
           recoverState.delete(family)
           cache.clear()
+          if (family !== 'stepfun') {
+            return json(res, 200, { status: 'ok', family, configured: true, usernameMasked: maskAccount(username), bound: false })
+          }
           // A StepFun password signs in over HTTP; a browser parked for it
           // would only fight the password session over the same account.
-          if (family === 'stepfun') stopKeepAlive('stepfun').catch(() => {})
-          if (family === 'stepfun') {
-            // Prove the credentials right away and bind the session they buy.
-            const ok = await stepfunRelogin()
-            if (!ok) {
-              return json(res, 200, { status: 'error', family, configured: true, usernameMasked: maskAccount(username), message: lastLoginError.get('stepfun') ?? 'StepFun sign-in failed' })
-            }
-            const secret = await secretFor('stepfun', {}, '')
+          await stopKeepAlive('stepfun')
+          // Prove the credentials right away and bind the session they buy —
+          // and prove the usage API accepts that session, not only the
+          // passport service: the two have disagreed before.
+          const signedIn = await stepfunPasswordSignIn()
+          if (!signedIn) {
             return json(res, 200, {
-              status: 'ok',
+              status: 'error',
               family,
               configured: true,
               usernameMasked: maskAccount(username),
-              bound: true,
-              expiresAt: secret === null ? null : stepfunTokenExpiryMs(secret) ?? null,
+              message: lastLoginError.get('stepfun') ?? 'StepFun sign-in failed',
             })
           }
-          return json(res, 200, { status: 'ok', family, configured: true, usernameMasked: maskAccount(username), bound: false })
+          const secret = await secretFor('stepfun', {}, '')
+          try {
+            await queryUncached('stepfun', secret, {})
+          } catch (error) {
+            return json(res, 200, {
+              status: 'error',
+              family,
+              configured: true,
+              usernameMasked: maskAccount(username),
+              message: `signed in, but the console refused the session: ${error?.message ?? String(error)}`,
+            })
+          }
+          return json(res, 200, {
+            status: 'ok',
+            family,
+            configured: true,
+            usernameMasked: maskAccount(username),
+            bound: true,
+            expiresAt: secret === null ? null : stepfunTokenExpiryMs(secret) ?? null,
+          })
         } catch (error) {
           return json(res, 500, { status: 'error', message: String(error?.message ?? error) })
         }
@@ -3222,7 +3423,13 @@ document.getElementById('save').onclick = async () => {
       kind: 'exact',
       path: `${ROUTE_PREFIX}/raw`,
       handler: async (req, res) => {
+        // Only what the console answered may leave this route: upstream
+        // response cookies (session tokens) stay inside the host.
+        const publicResult = (result) => (result === null || result === undefined
+          ? null
+          : { status: result.status, ok: result.ok, data: result.data })
         try {
+          if (!sameOrigin(req)) return json(res, 403, { error: 'cross-site request refused' })
           const url = new URL(req.url ?? '/', 'http://localhost')
           const family = url.searchParams.get('family') ?? 'opencode-go'
           const provider = url.searchParams.get('provider') ?? ''
@@ -3260,7 +3467,7 @@ document.getElementById('save').onclick = async () => {
               fetchJson(`${base}/QueryStepPlanRateLimit`, { method: 'POST', headers, body: '{}' }),
               fetchJson(`${base}/GetStepPlanStatus`, { method: 'POST', headers, body: '{}' }).catch(() => null),
             ])
-            return json(res, 200, { family, rate, plan })
+            return json(res, 200, { family, rate: publicResult(rate), plan: publicResult(plan) })
           }
           if (family === 'mimo') {
             const base = 'https://platform.xiaomimimo.com/api/v1'
@@ -3270,7 +3477,12 @@ document.getElementById('save').onclick = async () => {
               fetchJson(`${base}/tokenPlan/detail`, { headers }).catch(() => null),
               fetchJson(`${base}/balance`, { headers }).catch(() => null),
             ])
-            return json(res, 200, { family, usage, detail, balance })
+            return json(res, 200, {
+              family,
+              usage: publicResult(usage),
+              detail: publicResult(detail),
+              balance: publicResult(balance),
+            })
           }
           let target = null
           if (family === 'sub2api') {
@@ -3292,7 +3504,14 @@ document.getElementById('save').onclick = async () => {
               fetchJson(`${root}/v1/dashboard/billing/subscription`, { headers }).catch(() => null),
               fetchJson(`${root}/v1/dashboard/billing/usage?start_date=${startDate}&end_date=${endDate}`, { headers }).catch(() => null),
             ])
-            return json(res, 200, { family, root, statusRes, tokenRes, subRes, usageRes })
+            return json(res, 200, {
+              family,
+              root,
+              statusRes: publicResult(statusRes),
+              tokenRes: publicResult(tokenRes),
+              subRes: publicResult(subRes),
+              usageRes: publicResult(usageRes),
+            })
           }
           if (family === 'opencode-go') target = 'https://opencode.ai/zen/go/v1/usage'
           else if (family === 'kimi') target = 'https://api.kimi.com/coding/v1/usages'
@@ -3542,7 +3761,7 @@ document.getElementById('save').onclick = async () => {
         out.recovery = Object.fromEntries([...recoverState.entries()].map(([family, state]) => [family, {
           failures: state.failures,
           blockedMs: recoverBlockedMs(family),
-          lastWindowAgoMs: state.lastWindowAt === 0 ? null : Date.now() - state.lastWindowAt,
+          lastWindowAgoMs: (lastLoginWindowAt.get(family) ?? 0) === 0 ? null : Date.now() - lastLoginWindowAt.get(family),
         }]))
         out.silentFailuresBeforeWindow = silentFailuresBeforeWindow()
         out.loginSessions = [...LOGIN_SESSIONS.values()].map(loginSnapshot)
