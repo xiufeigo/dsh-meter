@@ -445,6 +445,30 @@ for (const expected of ['New API · myrelay', 'left 60%', 'Balance', '$12.00', '
 }
 activeLocale = 'zh'
 
+// ── 15. recovery opened a login window: the badge says so, not "bind" ──
+activeLocale = 'zh'
+tree = renderCell('conversation.composer.dock', {
+  useProjection: selectionOf('xiaomi-token-plan-cn', 'mimo-v2.6-flash'),
+  t,
+}, [false, null, 0, {
+  status: 'no-credential', expired: true, family: 'mimo', providerLabel: 'MiMo',
+  setupFamily: 'mimo', loginWindow: 'opened', message: 'MiMo 登录窗口已打开，完成登录后徽章会自动恢复', windows: [],
+}])
+text = toText(tree)
+notes.push(`[login-window-zh] ${text.trim()}`)
+if (!text.includes('登录中…')) problems.push(`login window: expected ⏳ 登录中…, got "${text.trim()}"`)
+if (text.includes('绑定')) problems.push('login window: must not ask the user to bind while the window is open')
+
+// Settings carries the username & password block for both consoles.
+for (const [label, expanded, expected] of [
+  ['zh', settingsExpandedZh, ['账号密码登录', '不用浏览器，也不用 Edge', '仍需你在窗口里输入验证码']],
+  ['en', settingsExpandedEn, ['Username & password', 'no browser, no Edge', 'verification code']],
+]) {
+  for (const needle of expected) {
+    if (!toText(expanded, 1).includes(needle)) problems.push(`settings ${label}: missing "${needle}"`)
+  }
+}
+
 // ── report ────────────────────────────────────────────────────────────
 console.log(notes.join('\n\n'))
 console.log(`\nused locale keys: ${[...usedKeys].sort().join(', ')}`)

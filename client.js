@@ -28,6 +28,7 @@ window.__ModuleLoader__.load({
     const QUOTA_URL = '/plugins/dsh-meter/quota'
     const SETUP_URL = '/plugins/dsh-meter/setup'
     const LOGIN_URL = '/plugins/dsh-meter/login'
+    const ACCOUNT_URL = '/plugins/dsh-meter/account'
     const PROVIDERS_URL = '/plugins/dsh-meter/providers'
     const GATEWAYS_URL = '/plugins/dsh-meter/gateways'
     const LOG_URL = '/plugins/dsh-meter/log'
@@ -81,7 +82,7 @@ window.__ModuleLoader__.load({
         copyConsole: 'Copy console link',
         copied: 'Link copied ✓',
         autoLogin: 'Open browser & bind automatically',
-        autoLoginHint: 'Opens your default browser at the console sign-in page. After you sign in there, the badge reads that browser’s cookies and binds itself. Once bound, later binds reuse the saved profile with no window.',
+        autoLoginHint: 'Opens the console sign-in page in the badge’s own browser profile (a saved username & password is typed in for you) and binds as soon as you are signed in. Later, an expiring session is renewed silently first; this window only comes back when that fails.',
         autoChecking: 'Checking the saved sign-in…',
         autoWaiting: 'Waiting for you to sign in in the opened browser…',
         autoVerifying: 'Verifying the console sign-in…',
@@ -121,11 +122,26 @@ window.__ModuleLoader__.load({
         familyDeepseekAccount: 'DeepSeek Account',
         familyDeepseek: 'DeepSeek',
         notConnected: 'Not linked',
-        cookieExpired: 'Cookie expired — sync from Edge or re-bind',
+        cookieExpired: 'Session expired — renewing silently…',
+        loginWindowOpened: 'Login window opened — sign in there and the badge recovers by itself',
+        waitingLogin: 'Signing in…',
+        accountTitle: 'Username & password',
+        accountHintHttp: 'The badge signs in through the console API and renews the session itself before it expires — no browser, no Edge.',
+        accountHintAutofill: 'Typed into the login window for you. A new device may still be asked for a verification code — only you can read it; afterwards the profile stays signed in.',
+        accountUsername: 'Username (phone / email)',
+        accountPassword: 'Password',
+        accountSave: 'Save & sign in',
+        accountSaved: 'Saved ✓ {username}',
+        accountBound: 'Signed in and bound; the session renews itself',
+        accountClear: 'Clear',
+        accountCleared: 'Cleared',
+        accountEmpty: 'Enter both the username and the password',
+        accountShow: 'Username & password',
+        accountHide: 'Hide username & password',
         syncEdge: 'Read Cookie from Edge',
         syncEdgeBusy: 'Reading from Edge…',
         syncEdgeOk: 'Synced from {browser} ✓',
-        syncEdgeHint: 'Reads directly from your running Edge session (enable remote debugging once at edge://inspect/#remote-debugging).',
+        syncEdgeHint: 'Manual fallback only: reads your running Edge session. Edge authorises remote debugging per connection, so this runs when you click — never on its own.',
         copyEdgeUrl: 'Copy Edge debug link',
         gatewaySection: 'Self-hosted Gateways (Sub2API / New API)',
         gatewayHint: 'Gateways are auto-detected from each provider URL, or assign any custom provider via the dropdown below.',
@@ -163,7 +179,7 @@ window.__ModuleLoader__.load({
         copyConsole: '复制控制台地址',
         copied: '地址已复制 ✓',
         autoLogin: '浏览器登录并自动绑定',
-        autoLoginHint: '会用你的默认浏览器打开控制台登录页。你在里面登录后，徽章直接读取那个浏览器的 Cookie 自动绑定。绑定过一次之后，以后再绑会复用已登录的浏览器配置，不用再开窗口。',
+        autoLoginHint: '会用插件自己的浏览器配置打开控制台登录页（配置了账号密码会自动填好），登录后自动绑定。之后会话过期会先静默续期，续不上才会再弹这个窗口。',
         autoChecking: '正在检查已保存的登录状态…',
         autoWaiting: '已打开浏览器，请在里面完成登录，完成后会自动绑定…',
         autoVerifying: '正在校验控制台登录状态…',
@@ -203,11 +219,26 @@ window.__ModuleLoader__.load({
         familyDeepseekAccount: 'DeepSeek 账号',
         familyDeepseek: 'DeepSeek',
         notConnected: '未连接',
-        cookieExpired: 'Cookie 已过期，请从 Edge 读取或重新绑定',
+        cookieExpired: '登录已过期，正在静默续期…',
+        loginWindowOpened: '登录窗口已打开，在里面完成登录后徽章会自动恢复',
+        waitingLogin: '登录中…',
+        accountTitle: '账号密码登录',
+        accountHintHttp: '填好后徽章直接通过接口登录，token 到期前自动续期——不用浏览器，也不用 Edge。',
+        accountHintAutofill: '登录窗口弹出时会自动填好账号密码。首次登录或触发风控时仍需你在窗口里输入验证码；之后这个配置会保持登录。',
+        accountUsername: '账号（手机号 / 邮箱）',
+        accountPassword: '密码',
+        accountSave: '保存并登录',
+        accountSaved: '已保存 ✓ {username}',
+        accountBound: '已登录并绑定，会话会自动续期',
+        accountClear: '清除',
+        accountCleared: '已清除',
+        accountEmpty: '请填写账号和密码',
+        accountShow: '账号密码',
+        accountHide: '收起账号密码',
         syncEdge: '从 Edge 读取 Cookie',
         syncEdgeBusy: '正在读取 Edge Cookie…',
         syncEdgeOk: '已从 {browser} 读取并绑定 ✓',
-        syncEdgeHint: '直接读取当前 Edge 浏览器的登录态（首次需在 Edge 打开 edge://inspect/#remote-debugging 开启远程调试）。',
+        syncEdgeHint: '仅作手动兜底：直接读取当前 Edge 的登录态。Edge 对远程调试是按连接授权的，所以只在你点击时连接，不会自动触发。',
         copyEdgeUrl: '复制 Edge 调试地址',
         gatewaySection: '自建网关（Sub2API / New API）',
         gatewayHint: '插件会自动通过各 provider 的 URL 识别类型，也可以用下面的下拉框手动绑定或移除。',
@@ -235,12 +266,17 @@ window.__ModuleLoader__.load({
         title: 'StepFun',
         loginUrl: 'https://platform.stepfun.com/plan-subscribe',
         placeholder: 'Oasis-Webid=…; sessionid=…; …',
+        // `http`: the badge signs in over the console API by itself.
+        accountMode: 'http',
       },
       {
         family: 'mimo',
         title: '小米 MiMo',
         loginUrl: 'https://platform.xiaomimimo.com/',
         placeholder: 'api-platform_serviceToken=…; userId=…; …',
+        // `autofill`: credentials are typed into the login window; a code
+        // may still be required on a new device.
+        accountMode: 'autofill',
       },
     ]
 
@@ -333,6 +369,14 @@ window.__ModuleLoader__.load({
 .qm-ta{width:100%;box-sizing:border-box;min-height:74px;border:1px solid var(--dsw-alias-border-l1);border-radius:6px;
   padding:8px;font:inherit;font-size:12px;line-height:18px;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);resize:vertical}
 .qm-ta:focus{outline:none;border-color:var(--dsw-alias-border-l2)}
+.qm-input{box-sizing:border-box;min-width:0;flex:1;border:1px solid var(--dsw-alias-border-l1);border-radius:6px;
+  padding:5px 8px;font:inherit;font-size:12px;line-height:18px;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary)}
+.qm-input:focus{outline:none;border-color:var(--dsw-alias-border-l2)}
+.qm-account{display:flex;flex-direction:column;gap:8px;padding:10px 12px;border:1px solid var(--dsw-alias-border-l1);
+  border-radius:8px;background:var(--dsw-alias-bg-layer-1)}
+.qm-account-head{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap}
+.qm-account-title{font-weight:500}
+.qm-account-fields{display:flex;flex-direction:column;gap:6px}
 .qm-set{display:flex;flex-direction:column;gap:14px;font-size:13px;color:var(--dsw-alias-label-primary);max-width:640px}
 .qm-card{border:1px solid var(--dsw-alias-border-l1);border-radius:10px;padding:12px 14px;display:flex;flex-direction:column;gap:8px}
 .qm-card-head{display:flex;align-items:center;justify-content:space-between;gap:10px}
@@ -771,6 +815,129 @@ window.__ModuleLoader__.load({
       }, [family, active, onBound])
     }
 
+    // ── account (username + password) ───────────────────────────────────
+
+    /**
+     * Username + password for a console family. StepFun is signed in over
+     * HTTP the moment it is saved; MiMo keeps the pair for the login window
+     * to type in. The password is sent once and never read back.
+     */
+    function AccountForm ({ plan, t, onBound }) {
+      const [state, setState] = React.useState({ loaded: false, configured: false, usernameMasked: null })
+      const [open, setOpen] = React.useState(false)
+      const [username, setUsername] = React.useState('')
+      const [password, setPassword] = React.useState('')
+      const [busy, setBusy] = React.useState(false)
+      const [message, setMessage] = React.useState(null)
+
+      React.useEffect(() => {
+        let alive = true
+        fetch(`${ACCOUNT_URL}?family=${encodeURIComponent(plan.family)}`, {
+          credentials: 'same-origin',
+          headers: { accept: 'application/json' },
+        })
+          .then((response) => (response.ok ? response.json() : Promise.reject(new Error(`HTTP ${response.status}`))))
+          .then((data) => {
+            if (alive) setState({ loaded: true, configured: data.configured === true, usernameMasked: data.usernameMasked ?? null })
+          })
+          .catch(() => { if (alive) setState((prev) => ({ ...prev, loaded: true })) })
+        return () => { alive = false }
+      }, [plan.family])
+
+      const post = (payload) => fetch(`${ACCOUNT_URL}?family=${encodeURIComponent(plan.family)}`, {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'content-type': 'application/json', accept: 'application/json' },
+        body: JSON.stringify(payload),
+      })
+        .then((response) => response.json())
+
+      const save = () => {
+        const name = username.trim()
+        if (name.length === 0 || password.length === 0) { setMessage({ error: t('accountEmpty') }); return }
+        setBusy(true)
+        setMessage(null)
+        post({ username: name, password })
+          .then((data) => {
+            setPassword('')
+            if (data.status === 'ok') {
+              setState({ loaded: true, configured: true, usernameMasked: data.usernameMasked ?? null })
+              setOpen(false)
+              setMessage({ ok: data.bound === true ? t('accountBound') : t('accountSaved', { username: data.usernameMasked ?? '' }) })
+              report('account-saved', `${plan.family} bound=${data.bound === true}`)
+              if (data.bound === true) onBound()
+            } else {
+              setMessage({ error: String(data.message ?? t('autoFailed')) })
+            }
+          })
+          .catch((error) => setMessage({ error: String(error?.message ?? error) }))
+          .finally(() => setBusy(false))
+      }
+
+      const clear = () => {
+        setBusy(true)
+        post({ clear: true })
+          .then((data) => {
+            if (data.status === 'ok') {
+              setState({ loaded: true, configured: false, usernameMasked: null })
+              setOpen(false)
+              setMessage({ ok: t('accountCleared') })
+            } else {
+              setMessage({ error: String(data.message ?? t('autoFailed')) })
+            }
+          })
+          .catch((error) => setMessage({ error: String(error?.message ?? error) }))
+          .finally(() => setBusy(false))
+      }
+
+      const hint = plan.accountMode === 'http' ? t('accountHintHttp') : t('accountHintAutofill')
+      return h('div', { className: 'qm-account' },
+        h('div', { className: 'qm-account-head' },
+          h('span', { className: 'qm-account-title' }, t('accountTitle')),
+          h('span', { className: 'qm-btnrow' },
+            state.configured === true
+              ? h('span', { className: 'qm-ok' }, t('accountSaved', { username: state.usernameMasked ?? '' }))
+              : null,
+            state.configured === true
+              ? h('button', { type: 'button', className: 'qm-btn', disabled: busy, onClick: clear }, t('accountClear'))
+              : null,
+            h('button', { type: 'button', className: 'qm-link', onClick: () => setOpen((value) => !value) },
+              open ? t('accountHide') : t('accountShow')),
+          ),
+        ),
+        h('div', { className: 'qm-mini' }, hint),
+        open
+          ? h('div', { className: 'qm-account-fields' },
+              h('div', { className: 'qm-btnrow' },
+                h('input', {
+                  className: 'qm-input',
+                  type: 'text',
+                  value: username,
+                  autoComplete: 'username',
+                  placeholder: t('accountUsername'),
+                  spellCheck: false,
+                  onChange: (event) => { setUsername(event.target.value); setMessage(null) },
+                }),
+                h('input', {
+                  className: 'qm-input',
+                  type: 'password',
+                  value: password,
+                  autoComplete: 'current-password',
+                  placeholder: t('accountPassword'),
+                  onChange: (event) => { setPassword(event.target.value); setMessage(null) },
+                }),
+              ),
+              h('div', { className: 'qm-btnrow' },
+                h('button', { type: 'button', className: 'qm-btn qm-primary', disabled: busy, onClick: save },
+                  busy ? t('loading') : t('accountSave')),
+                message?.ok === true ? h('span', { className: 'qm-ok' }, message.ok) : null,
+                typeof message?.error === 'string' ? h('span', { className: 'qm-error' }, message.error) : null,
+              ),
+            )
+          : (message?.ok === true ? h('div', { className: 'qm-ok' }, message.ok) : null),
+      )
+    }
+
     // ── bind form ───────────────────────────────────────────────────────
 
     function BindForm ({ plan, t, onBound, autoFocus }) {
@@ -882,6 +1049,7 @@ window.__ModuleLoader__.load({
         : null
 
       return h(React.Fragment, null,
+        h(AccountForm, { plan, t, onBound }),
         h('div', { className: 'qm-login' },
           h('div', { className: 'qm-mini' }, t('autoLoginHint')),
           h('div', { className: 'qm-btnrow' },
@@ -1053,6 +1221,9 @@ window.__ModuleLoader__.load({
       } else if (data.status === 'no-credential') {
         const family = typeof data.setupFamily === 'string' ? data.setupFamily : null
         const plan = CONSOLE_PLANS.find((candidate) => candidate.family === family)
+        // The Host opened a login window on the user's desktop: the badge
+        // watches that session and flips to numbers once it binds.
+        const windowOpen = data.loginWindow === 'opened' && plan !== undefined
         trigger = h('button', {
           ref: triggerRef,
           type: 'button',
@@ -1061,7 +1232,9 @@ window.__ModuleLoader__.load({
           onClick: () => { if (plan !== undefined) setBindFamily(family); else setOpen(true) },
         },
         h(RingMark, { percent: 0, tone: '' }),
-        h('span', null, plan === undefined ? `🔒 ${t('notConnected')}` : `🔒 ${t('bind')}`))
+        h('span', null, plan === undefined
+          ? `🔒 ${t('notConnected')}`
+          : windowOpen ? `⏳ ${t('waitingLogin')}` : `🔒 ${t('bind')}`))
       } else if (data.status === 'error') {
         trigger = h('button', {
           ref: triggerRef,
@@ -1123,7 +1296,9 @@ window.__ModuleLoader__.load({
       if (data.status === 'ok') {
         status = h('span', { className: 'qm-ok' }, `✓ ${formatQuotaSummary(data, t)}`)
       } else if (data.status === 'no-credential') {
-        status = h('span', { className: 'qm-note' }, data.expired === true ? t('cookieExpired') : t('notBound'))
+        status = h('span', { className: 'qm-note' }, data.loginWindow === 'opened'
+          ? t('loginWindowOpened')
+          : data.expired === true ? t('cookieExpired') : t('notBound'))
       } else if (data.status === 'error') {
         status = h('span', { className: 'qm-error' }, String(data.message ?? t('queryFailed')))
       }

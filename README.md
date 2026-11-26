@@ -38,8 +38,8 @@
 | **OpenCode Go** | `zen/go/v1/usage` | 否，复用已有 API Key |
 | **DeepSeek 账号** | DSH 账号钱包余额（`deepseekAccount.getBalance`） | 否，复用已登录的 DSH 账号 |
 | **DeepSeek** | `GET /user/balance` | 否，复用已有 API Key |
-| **StepFun** | 控制台 `QueryStepPlanRateLimit` | 是，浏览器登录一次或从 Edge 读取 |
-| **小米 MiMo** | 控制台 `tokenPlan/usage` | 是，浏览器登录一次或从 Edge 读取 |
+| **StepFun** | 控制台 `QueryStepPlanRateLimit` | 是，账号密码登录（纯接口，自动续期）或浏览器登录一次 |
+| **小米 MiMo** | 控制台 `tokenPlan/usage` | 是，浏览器登录一次（验证码仅首次），profile 记住受信设备 |
 | **Sub2API** | 自建网关 `GET {baseURL}/v1/usage` | 否，复用该 provider 自己的 API Key |
 | **New API / One API** | 自建网关 `/api/usage/token` 与 `/v1/dashboard/billing/*` | 否，复用该 provider 自己的 API Key |
 
@@ -105,27 +105,40 @@ MiniMax / Kimi / OpenCode Go / DeepSeek 直接复用「设置 → 模型」里�
 
 **DeepSeek 账号**则复用 DSH「设置 → 账号」里已登录的账号：插件通过 DSH 的账号服务读取钱包余额，自己**不接触**账号令牌；没登录时徽章显示 `🔒 未连接`，登录后刷新即可。
 
-### 控制台类：登录一次 / 从日常 Edge 直接同步
+### 控制台类：账号密码一次配好，之后静默续期
 
-**StepFun** 和 **小米 MiMo** 的套餐额度只在控制台里，需要绑一次登录态，支持三种方式：
+**StepFun** 和 **小米 MiMo** 的套餐额度只在控制台里。两者都不需要再碰 Edge：
 
-#### 方式一：直接从日常 Edge 读取 Cookie（推荐，过期后可自动静默续签）
+#### StepFun：账号密码 → 纯接口登录（推荐）
 
-1. 在你平时使用的 Edge 地址栏打开 `edge://inspect/#remote-debugging`，打开远程调试开关（Edge 会在本地生成 `DevToolsActivePort`）
-2. 在 Edge 里正常登录 StepFun / 小米 MiMo 控制台
-3. 在插件设置或绑定弹窗里点击「**从 Edge 读取 Cookie**」（首次连接时 Edge 顶部会弹出授权提示，点击**允许**即可）
+1. 切到 StepFun 模型，圆环会变成 `🔒 绑定`，点它（也可以走 设置 → 内置插件 → 额度仪表）
+2. 展开「**账号密码登录**」，填账号（手机号 / 邮箱）和密码，点「**保存并登录**」
 
-之后当 StepFun 或 MiMo 的短期 Cookie 过期时，插件会自动从开启了远程调试的 Edge 读取最新 Cookie 续上（如果 Edge 中只有长期 SSO 登录态、短期控制台 token 已过期，插件还会自动借由无头浏览器用该 SSO 登录态静默换取新 token）。
+插件直接调控制台自己的 Passport 接口：`RegisterDevice`（匿名设备）→ `SignInByPassword` → 拿到 `Oasis-Token`（一个 JWT）。之后徽章会**解出 JWT 的 `exp`，在过期前 2 分钟自动重登**，整个过程不开浏览器、不弹窗、不连 Edge。密码存在 DSH 凭据库里（和 Cookie 同一个地方），任何接口都不会回传。
 
-#### 方式二：插件内置浏览器登录并自动绑定
+#### 小米 MiMo：登录一次，profile 记住设备
 
-1. 切到对应模型，圆环会变成 `🔒 绑定`，点它
-   （也可以走 设置 → 内置插件 → 额度仪表）
-2. 点「**浏览器登录并自动绑定**」
-3. 会弹出你电脑的**默认浏览器**（Windows 上是 Edge）并打开控制台登录页
-4. 在里面正常登录 → 插件自动读取 Cookie、校验、绑定，**不需要手动复制任何东西**
+1. 同样点开绑定弹窗，可以先把小米账号密码填进「账号密码登录」（可选，用于自动填写）
+2. 点「**浏览器登录并自动绑定**」→ 弹出插件自己的浏览器窗口停在小米登录页，账号密码已填好
+3. 首次在新设备上登录，小米会要**短信验证码**——这一步只有你能做，在窗口里输完即可；插件监听到登录态后自动绑定、自动关窗
 
-绑定成功后浏览器配置会留在 `%USERPROFILE%\.dsh\dsh-meter\browser-profiles\`，插件启动时也会自动唤醒后台保活页；遇到过期会自动尝试从 Edge 或保活配置静默续上。
+之后插件的浏览器 profile 就是「受信设备」（jar 里能看到 `passToken` / `deviceId`，有效期约一个月）。控制台 token 过期时，后台保活页会重新落到控制台首页，小米 SSO 看到 `passToken` 就静默发新 token，不要密码、不要验证码。`passToken` 到期或被风控踢掉时，插件才会再弹一次窗口。
+
+#### 自动恢复的顺序（两家通用）
+
+```
+① 账密重登（StepFun）        ─┐
+② 保活页重落到控制台，重走 SSO  ├─ 全部静默，0 弹窗
+③ 用本地 profile 重启 headless ─┘
+④ 都失败 → 弹一次登录窗口（30 分钟内最多一次，账号密码自动填好）
+⑤ Edge 读取 → 只在你手动点按钮时才连
+```
+
+一轮恢复失败后按 1 → 2 → 5 → 10 → 30 分钟指数退避；绑定成功即清零。徽章在 🔒 态下每 3 分钟轮询一次，但后端退避保证不会每次都触发浏览器或 Edge。
+
+#### Edge 读取（仅手动兜底）
+
+如果你更想直接复用日常 Edge 的登录态：在 Edge 地址栏打开 `edge://inspect/#remote-debugging` 开启远程调试，在插件里点「**从 Edge 读取 Cookie**」。Edge 对远程调试是**按连接授权**的，每连一次弹一次窗，所以这个动作永远不会自动触发。
 
 不想用浏览器？绑定弹窗里还有「或者手动粘贴 Cookie · 展开」的兜底路径。
 
@@ -164,8 +177,14 @@ MiniMax / Kimi / OpenCode Go / DeepSeek 直接复用「设置 → 模型」里�
 
 - **控制台登录**用 `--remote-debugging-pipe` 起一个自己控制的 Chromium，通过 DevTools 协议
   （NUL 分隔的 JSON-RPC，走 fd 3/4）读它的 Cookie 罐。不占端口、不需要 Playwright/Puppeteer 之类的依赖。
-- **StepFun 的 token 很短命**，所以绑定成功后会在后台留一个无头浏览器停在控制台页面，让页面自己的前端去续期，
-  每 2 分钟同步一次 Cookie；查询遇到 401 会先自动重试一次，连续失败 3 次就自动关掉。
+- **StepFun 的 token 很短命**，但它是 JWT，而且控制台的 Passport 接口支持账密登录
+  （`RegisterDevice` → `SignInByPassword`）。配了账号密码后，插件解出 `exp`、在到期前主动重登，不开浏览器。
+- **MiMo 的 token 靠 SSO 续**：后台保活页停在控制台，token 失效时重新落到控制台首页，小米 SSO 用 profile 里的
+  `passToken` 静默换新。保活页每 2 分钟读一次 cookie 罐，即使罐子没变也每 5 分钟向控制台强校验一次——
+  服务端作废 token 时本地罐子是不会变的，光看"变没变"会被骗。
+- **Cookie 头按浏览器规则拼**：只保留会发给 API host 的 cookie（RFC 6265 domain/path 匹配，长 path 在前），
+  同名不同域的 cookie 不再合并。`.mi.com` 上的 `serviceToken` 永远不会串到 `platform.xiaomimimo.com` 的请求里。
+- **Edge 永远只手动**：Edge 对远程调试按连接授权，每连一次弹一次窗，所以自动恢复链里没有它。
 - **徽章位置**在 `conversation.composer.dock` 插槽里。DSH 的 dock 先渲染插槽再渲染上下文环，
   所以用 flex `order` 把自己的节点推到最后一个，落在上下文环右边。
 - **DeepSeek 官方**：`deepseek-account` 走 DSH 的 `deepseekAccount.getBalance()`（账号令牌不经过插件），
@@ -200,12 +219,15 @@ dsh plugin --profile desktop add "C:\path\to\dsh-meter"
 | `GET /plugins/dsh-meter/raw?family=...` | 各套餐的原始用量响应（不含密钥） |
 | `GET /plugins/dsh-meter/hmr` | 让客户端模块重新装载，免刷新 |
 | `GET /plugins/dsh-meter/keepalive?family=...` | 手动启停后台保活浏览器 |
+| `GET /plugins/dsh-meter/account?family=...` | 该套餐是否配了账号密码（只返回脱敏账号，不含密码） |
 
 ## 已知限制
 
 - 依赖 DSH 的 `conversation.composer.dock` 与 `settings.plugins.tab` 两个 UI 插槽，随 DSH 版本变化；DSH < 0.2.2-rc.1 可能没有
 - 控制台登录需要 Chromium 系浏览器（Chrome / Edge / Brave / Vivaldi / Opera），Firefox 不支持 `--remote-debugging-pipe`
-- 控制台接口一旦改版，对应的解析要跟着改
+- 控制台接口一旦改版，对应的解析要跟着改；StepFun 账密登录依赖其 Passport 接口（`RegisterDevice` / `SignInByPassword`），改版时同样要跟着改
+- 小米首次在新 profile 上登录必须短信验证码（风控要求），账密只能省掉输密码，省不掉验证码；之后 profile 受信就不再要
+- 插件配置项（`cordis.patch.yml`）：`disableAutoKeepAlive`（不启保活浏览器）、`disableAutoLoginWindow`（恢复失败时不自动弹登录窗）、`headlessRefreshMs`（保活重落的等待上限，默认 15000）
 - DeepSeek 两条官方通道只有余额接口，没有公开的「套餐百分比」接口；余额接口改版时对应解析要跟着改
 - 插件只把百分比、余额、重置时间和套餐名回传给界面，**不显示也不外传任何密钥、Cookie 或账号令牌**
 

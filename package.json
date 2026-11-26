@@ -1,6 +1,6 @@
 {
   "name": "dsh-meter",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "private": true,
   "type": "module",
   "description": "A usage ring under the DSH composer showing the current model plan's headroom (or remaining balance for balance-metered routes), with per-window reset dates and one-click console sign-in.",

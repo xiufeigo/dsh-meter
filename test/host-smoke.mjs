@@ -3,7 +3,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { Readable } from 'node:stream'
-import { apply } from '../index.js'
+import { apply, internals } from '../index.js'
 
 const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-meter-host-test-'))
 const dataDir = path.join(tempRoot, 'meter-data')
@@ -33,7 +33,8 @@ function makeMockHarness ({ providersInherited, providersOverride, envCreds = {}
         return {
           resolve: async (nameOrRef) => {
             const k = String(nameOrRef)
-            return credMap.has(k) ? { value: credMap.get(k) } : null
+            const v = credMap.get(k)
+            return typeof v === 'string' && v.length > 0 ? { value: v } : null
           },
           set: async (nameOrRef, val) => { credMap.set(String(nameOrRef), String(val)) },
           describe: async (nameOrRef) => ({ key: String(nameOrRef), present: credMap.has(String(nameOrRef)) }),
@@ -101,14 +102,17 @@ function makeMockFetch (handler) {
     return {
       status,
       ok: status >= 200 && status < 300,
+      headers: { get: () => null, getSetCookie: () => [] },
       async text () { return bodyText },
     }
   }
 }
 
+let wsConnections = 0
 function makeMockWebSocketClass (cookiesByContext) {
   return class MockWebSocket {
     constructor (url) {
+      wsConnections += 1
       this.url = url
       this.listeners = new Map()
       queueMicrotask(() => this.#emit('open', {}))
@@ -146,16 +150,93 @@ function makeMockWebSocketClass (cookiesByContext) {
   }
 }
 
+/** A JWT-shaped StepFun access token that retires `secondsFromNow`. */
+function fakeJwt (secondsFromNow, sub = 'user-1') {
+  const b64 = (value) => Buffer.from(JSON.stringify(value)).toString('base64url')
+  return `${b64({ alg: 'HS256', typ: 'JWT' })}.${b64({ sub, exp: Math.floor(Date.now() / 1000) + secondsFromNow })}.sig`
+}
+
 try {
-  // ── shared mock HTTP upstream ───────────────────────────────────────
+  // ── 0. pure helpers ───────────────────────────────────────────────────
+  {
+    const cookies = [
+      { name: 'serviceToken', value: 'mi-wide', domain: '.mi.com', path: '/' },
+      { name: 'userId', value: '1', domain: '.account.xiaomi.com', path: '/' },
+      { name: 'serviceToken', value: 'console', domain: 'platform.xiaomimimo.com', path: '/' },
+      { name: 'serviceToken', value: 'wide', domain: '.xiaomimimo.com', path: '/' },
+      { name: 'pref', value: 'x', domain: 'platform.xiaomimimo.com', path: '/api/' },
+      { name: 'consoleOnly', value: 'z', domain: 'platform.xiaomimimo.com', path: '/console' },
+      { name: 'unrelated', value: 'y', domain: 'example.com', path: '/' },
+    ]
+    // Seeding a profile keeps every related cookie, one per (domain, path, name).
+    const all = internals.pickConsoleCookies(cookies, ['xiaomimimo.com', 'xiaomi.com', 'mi.com'])
+    assert.equal(all.length, 6)
+    assert.equal(all.filter((c) => c.name === 'serviceToken').length, 3)
+    // The API host only ever sees what a browser would send it for /api/:
+    // host-only and domain cookies that match, longer paths first.
+    const header = internals.consoleCookieHeader('mimo', cookies)
+    assert.equal(header, 'pref=x; serviceToken=console; serviceToken=wide')
+    assert.equal(internals.consoleCookieHeader('stepfun', [
+      { name: 'Oasis-Token', value: 'sso', domain: 'account.stepfun.com', path: '/' },
+      { name: 'Oasis-Token', value: 'api', domain: 'platform.stepfun.com', path: '/' },
+      { name: 'Oasis-Webid', value: 'w', domain: '.stepfun.com', path: '/' },
+    ]), 'Oasis-Token=api; Oasis-Webid=w')
+    assert.equal(internals.cookieDomainMatches('.xiaomi.com', 'platform.xiaomimimo.com'), false)
+    assert.equal(internals.cookieDomainMatches('.xiaomimimo.com', 'platform.xiaomimimo.com'), true)
+    assert.equal(internals.cookieDomainMatches('platform.xiaomimimo.com', 'platform.xiaomimimo.com'), true)
+    assert.equal(internals.cookieDomainMatches('platform.xiaomimimo.com', 'sub.platform.xiaomimimo.com'), false)
+    assert.equal(internals.mimoCookieUsable('api-platform_serviceToken=abc'), true)
+    assert.equal(internals.mimoCookieUsable('userId=1'), false)
+
+    // JWT expiry drives StepFun's proactive renewal.
+    const jwt = fakeJwt(600)
+    assert.ok(Math.abs(internals.jwtExpiryMs(jwt) - (Date.now() + 600_000)) < 2_000)
+    assert.equal(internals.jwtExpiryMs('not-a-jwt'), null)
+    assert.equal(internals.cookieValueOf('a=1; Oasis-Token=ey.abc.sig; b=2', 'Oasis-Token'), 'ey.abc.sig')
+    assert.ok(Math.abs(internals.stepfunTokenExpiryMs(`Oasis-Token=${jwt}`) - (Date.now() + 600_000)) < 2_000)
+    assert.equal(internals.stepfunAccessToken({ accessToken: { raw: 'r', duration: 90 } }).raw, 'r')
+    assert.equal(internals.stepfunAccessToken({ access_token: { raw: 'r' } }).duration, null)
+    assert.equal(internals.passportErrorMessage({ code: 'unauthenticated', message: 'wrong password' }), 'wrong password')
+    assert.equal(internals.passportErrorMessage({ details: [{ code: 1, message: 'no such user' }] }), 'no such user')
+    assert.equal(internals.maskAccount('13812345678'), '138****78')
+    assert.equal(internals.maskAccount('someone@example.com'), 's***@example.com')
+    const autofill = internals.loginAutofillExpression('u', 'p')
+    assert.ok(autofill.includes('"u"') && autofill.includes('"p"') && autofill.startsWith('(') && autofill.endsWith(')'))
+  }
+
+  // ── shared mock HTTP upstream ─────────────────────────────────────────
   const fetchCalls = []
+  const passportCalls = []
   let plainProxyBillingReady = false
+  let stepfunTokenSeconds = 1800
   globalThis.fetch = makeMockFetch(async (url, init) => {
     fetchCalls.push({ url, auth: init?.headers?.authorization ?? '' })
     const cookie = String(init?.headers?.cookie ?? '')
 
+    if (url === 'https://platform.stepfun.com/') return { status: 200, body: '<html>console</html>' }
+    if (url === 'https://platform.stepfun.com/passport/proto.api.passport.v1.PassportService/RegisterDevice') {
+      passportCalls.push({ method: 'RegisterDevice', body: init?.body })
+      assert.equal(init?.headers?.['oasis-appid'], '10300')
+      return {
+        status: 200,
+        data: { accessToken: { raw: 'anon-token', duration: 3600, mode: 'ANONYMOUS' }, refreshToken: { raw: 'rt-anon' }, device: { deviceID: 'dev-server-1' } },
+      }
+    }
+    if (url === 'https://platform.stepfun.com/passport/proto.api.passport.v1.PassportService/SignInByPassword') {
+      const body = JSON.parse(String(init?.body ?? '{}'))
+      passportCalls.push({ method: 'SignInByPassword', body, anonCookie: cookie })
+      if (body.username !== 'user@example.com' || body.password !== 'secret') {
+        return { status: 401, data: { code: 'unauthenticated', message: '用户名或密码错误' } }
+      }
+      return { status: 200, data: { accessToken: { raw: fakeJwt(stepfunTokenSeconds), duration: stepfunTokenSeconds, mode: 'SIGN_IN' }, refreshToken: { raw: 'rt' } } }
+    }
     if (url === 'https://platform.stepfun.com/api/step.openapi.devcenter.Dashboard/QueryStepPlanRateLimit') {
-      if (cookie.includes('sessionid=fresh-from-edge')) {
+      const token = /Oasis-Token=([^;]+)/.exec(cookie)?.[1] ?? ''
+      let retired = false
+      try {
+        retired = String(JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString('utf8')).sub ?? '').startsWith('retired')
+      } catch { retired = false }
+      if (!retired && (cookie.includes('sessionid=fresh-from-edge') || cookie.includes('Oasis-Token=ey'))) {
         return {
           status: 200,
           data: {
@@ -172,7 +253,9 @@ try {
       return { status: 200, data: {} }
     }
     if (url === 'https://platform.xiaomimimo.com/api/v1/tokenPlan/usage') {
-      if (cookie.includes('serviceToken=edge-mimo-token') && cookie.includes('userId=42')) {
+      // A browser sends platform.xiaomimimo.com only its own serviceToken —
+      // neither account.xiaomi.com's userId nor mi.com's serviceToken reach it.
+      if (cookie.includes('serviceToken=edge-mimo-token') && !cookie.includes('userId=42') && !cookie.includes('mi-com-token')) {
         return { status: 200, data: { data: { usage: { percent: 0.2 } } } }
       }
       return { status: 401, data: { message: 'unauthorized' } }
@@ -272,9 +355,10 @@ try {
     },
   })
 
-  apply(h1.ctx, { dataDir, edgeUserDataDir, disableAutoKeepAlive: true })
+  const testConfig = { dataDir, edgeUserDataDir, disableAutoKeepAlive: true, disableAutoLoginWindow: true }
+  apply(h1.ctx, testConfig)
 
-  // ── 1. Edge cookie sync (missing port file -> active WebSocket -> quota recovery) ──
+  // ── 1. An expired console cookie is reported, never auto-synced from Edge ──
   const noPortRes = await h1.invoke('/plugins/dsh-meter/login/sync-edge', {
     method: 'POST',
     query: '?family=stepfun',
@@ -290,12 +374,31 @@ try {
     ],
     'edge-profile-2': [
       { name: 'passToken', value: 'sso-pass-token', domain: '.account.xiaomi.com', path: '/', expires: -1 },
+      { name: 'userId', value: '42', domain: '.account.xiaomi.com', path: '/', expires: -1 },
       { name: 'api-platform_serviceToken', value: 'edge-mimo-token', domain: 'platform.xiaomimimo.com', path: '/', expires: -1 },
-      { name: 'userId', value: '42', domain: '.xiaomimimo.com', path: '/', expires: -1 },
+      // A sibling service token on the wide mi.com domain: must never leak
+      // into the header sent to platform.xiaomimimo.com.
+      { name: 'serviceToken', value: 'mi-com-token', domain: '.mi.com', path: '/', expires: -1 },
     ],
   })
 
-  // StepFun starts with an expired cookie; querying quota auto-syncs from Edge!
+  // The port file is live now, yet a stale cookie must not open a WebSocket:
+  // Edge authorises remote debugging per connection, so it is manual-only.
+  const expiredQuota = await h1.invoke('/plugins/dsh-meter/quota', {
+    query: '?provider=stepfun&model=step-5',
+  })
+  assert.equal(expiredQuota.json.status, 'no-credential')
+  assert.equal(expiredQuota.json.expired, true)
+  assert.equal(wsConnections, 0, 'quota recovery must never connect to Edge on its own')
+
+  // The user presses the button: explicit Edge sync binds.
+  const stepfunSync = await h1.invoke('/plugins/dsh-meter/login/sync-edge', {
+    method: 'POST',
+    query: '?family=stepfun',
+  })
+  assert.equal(stepfunSync.json.status, 'ok')
+  assert.equal(stepfunSync.json.via, 'direct')
+  assert.equal(wsConnections, 1)
   const stepfunQuota = await h1.invoke('/plugins/dsh-meter/quota', {
     query: '?provider=stepfun&model=step-5',
   })
@@ -304,7 +407,8 @@ try {
   assert.equal(stepfunQuota.json.windows[0].percent, 25)
   assert.ok(h1.credMap.get('STEPFUN_COOKIE').includes('sessionid=fresh-from-edge'))
 
-  // Explicit Edge sync for MiMo also captures account.xiaomi.com SSO cookie in .dsh-jar.json
+  // Explicit Edge sync for MiMo keeps account.xiaomi.com SSO cookies in the
+  // jar (for re-seeding a profile) while the header only carries the API host's.
   const mimoSync = await h1.invoke('/plugins/dsh-meter/login/sync-edge', {
     method: 'POST',
     query: '?family=mimo',
@@ -313,6 +417,87 @@ try {
   assert.equal(mimoSync.json.browser, 'Microsoft Edge')
   const mimoJar = JSON.parse(fs.readFileSync(path.join(dataDir, 'browser-profiles', 'mimo', '.dsh-jar.json'), 'utf8'))
   assert.ok(mimoJar.some((c) => c.domain.includes('xiaomi.com') && c.name === 'passToken'))
+  assert.equal(h1.credMap.get('MIMO_COOKIE'), 'api-platform_serviceToken=edge-mimo-token')
+
+  // ── 1b. Username + password: StepFun signs in over HTTP, no Edge at all ──
+  const accountBefore = await h1.invoke('/plugins/dsh-meter/account', { query: '?family=stepfun' })
+  assert.equal(accountBefore.json.configured, false)
+  assert.equal(accountBefore.json.mode, 'http')
+
+  const badLogin = await h1.invoke('/plugins/dsh-meter/account', {
+    method: 'POST', query: '?family=stepfun', body: { username: 'user@example.com', password: 'wrong' },
+  })
+  assert.equal(badLogin.json.status, 'error')
+  assert.ok(badLogin.json.message.includes('用户名或密码错误'))
+
+  const accountRes = await h1.invoke('/plugins/dsh-meter/account', {
+    method: 'POST', query: '?family=stepfun', body: { username: 'user@example.com', password: 'secret' },
+  })
+  assert.equal(accountRes.json.status, 'ok')
+  assert.equal(accountRes.json.bound, true)
+  assert.equal(accountRes.json.usernameMasked, 'u***@example.com')
+  assert.ok(accountRes.json.expiresAt > Date.now())
+  assert.equal(JSON.stringify(accountRes.json).includes('secret'), false, 'the password never echoes back')
+  assert.equal(h1.credMap.get('STEPFUN_PASSWORD'), 'secret')
+  assert.ok(h1.credMap.get('STEPFUN_COOKIE').includes('Oasis-Token=ey'))
+  // RegisterDevice was sent with the empty body the console sends, and the
+  // sign-in carried the anonymous token as its Oasis-Token cookie.
+  const register = passportCalls.find((c) => c.method === 'RegisterDevice')
+  assert.equal(register.body, '{}')
+  const signIn = passportCalls.find((c) => c.method === 'SignInByPassword')
+  assert.ok(signIn.anonCookie.includes('Oasis-Token=anon-token'))
+  const wsAfterLogin = wsConnections
+
+  // A JWT about to retire is renewed proactively, before any 401.
+  h1.credMap.set('STEPFUN_COOKIE', `Oasis-Webid=w; Oasis-Token=${fakeJwt(30)}`)
+  stepfunTokenSeconds = 1800
+  const renewed = await h1.invoke('/plugins/dsh-meter/quota', { query: '?provider=stepfun&model=step-5' })
+  assert.equal(renewed.json.status, 'ok')
+  assert.equal(passportCalls.filter((c) => c.method === 'SignInByPassword').length, 3)
+  assert.ok(!h1.credMap.get('STEPFUN_COOKIE').includes(fakeJwt(30).split('.')[1]), 'stale JWT replaced')
+
+  // A token the console rejects (still unexpired) is replaced silently on 401.
+  h1.credMap.set('STEPFUN_COOKIE', `Oasis-Webid=w; Oasis-Token=${fakeJwt(3600, 'retired')}`)
+  const recovered = await h1.invoke('/plugins/dsh-meter/quota', { query: '?provider=stepfun&model=step-5' })
+  assert.equal(recovered.json.status, 'ok')
+  assert.equal(recovered.json.loginWindow, undefined)
+  assert.equal(passportCalls.filter((c) => c.method === 'SignInByPassword').length, 4)
+  assert.equal(wsConnections, wsAfterLogin, 'password recovery never touches Edge')
+
+  // Wrong password later: the error is surfaced, the ladder backs off, and
+  // still no Edge and no window.
+  h1.credMap.set('STEPFUN_PASSWORD', 'nope')
+  h1.credMap.set('STEPFUN_COOKIE', `Oasis-Webid=w; Oasis-Token=${fakeJwt(3600, 'retired-2')}`)
+  const failedRecover = await h1.invoke('/plugins/dsh-meter/quota', { query: '?provider=stepfun&model=step-5' })
+  assert.equal(failedRecover.json.status, 'no-credential')
+  assert.equal(failedRecover.json.expired, true)
+  assert.ok(failedRecover.json.message.includes('账号密码登录失败'))
+  assert.ok(failedRecover.json.retryAfter > 0)
+  assert.equal(wsConnections, wsAfterLogin)
+  // While backing off, a poll does not try the password again.
+  const duringBackoff = await h1.invoke('/plugins/dsh-meter/quota', { query: '?provider=stepfun&model=step-5' })
+  assert.equal(duringBackoff.json.status, 'no-credential')
+  assert.equal(passportCalls.filter((c) => c.method === 'SignInByPassword').length, 5)
+  // Clearing the account reports "not configured" and never returns secrets.
+  const cleared = await h1.invoke('/plugins/dsh-meter/account', {
+    method: 'POST', query: '?family=stepfun', body: { clear: true },
+  })
+  assert.equal(cleared.json.configured, false)
+  assert.equal((await h1.invoke('/plugins/dsh-meter/account', { query: '?family=stepfun' })).json.configured, false)
+
+  // MiMo without a usable cookie and without a configured account: the badge
+  // asks for a sign-in instead of reaching for Edge.
+  h1.credMap.set('MIMO_COOKIE', 'userId=42')
+  const mimoExpired = await h1.invoke('/plugins/dsh-meter/quota', { query: '?provider=xiaomi-token-plan-cn&model=mimo-v2' })
+  assert.equal(mimoExpired.json.status, 'no-credential')
+  assert.equal(mimoExpired.json.expired, true)
+  assert.equal(mimoExpired.json.setupFamily, 'mimo')
+  assert.equal(wsConnections, wsAfterLogin)
+
+  const status = await h1.invoke('/plugins/dsh-meter/status')
+  assert.equal(status.json.accounts.stepfun.configured, false)
+  assert.equal(status.json.accounts.mimo.configured, false)
+  assert.equal(typeof status.json.recovery.stepfun.failures, 'number')
 
   // ── 2. URL auto-detection via /providers?probe=1 ────────────────────
   const probeRes = await h1.invoke('/plugins/dsh-meter/providers', { query: '?probe=1' })
@@ -399,7 +584,7 @@ try {
   // Reload plugin with same dataDir -> persisted manual gateway assignment survives
   h1.dispose()
   const h2 = makeMockHarness({ providersInherited, providersOverride })
-  apply(h2.ctx, { dataDir, edgeUserDataDir, disableAutoKeepAlive: true })
+  apply(h2.ctx, testConfig)
   const reloadedProviders = await h2.invoke('/plugins/dsh-meter/providers')
   const reloadedPlain = reloadedProviders.json.providers.find((p) => p.id === 'custom_plain')
   assert.equal(reloadedPlain.family, 'new-api')
