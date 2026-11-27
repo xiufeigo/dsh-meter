@@ -274,7 +274,7 @@ window.__ModuleLoader__.load({
       {
         family: 'mimo',
         title: '小米 MiMo',
-        loginUrl: 'https://platform.xiaomimimo.com/',
+        loginUrl: 'https://platform.xiaomimimo.com/console/plan-manage',
         placeholder: 'api-platform_serviceToken=…; userId=…; …',
         // `autofill`: credentials are typed into the login window; a code
         // may still be required on a new device.

@@ -508,7 +508,7 @@ const FAMILY_KEY_ENVS = {
 
 const CONSOLE_TARGETS = {
   stepfun: { loginUrl: 'https://platform.stepfun.com/plan-subscribe', envName: 'STEPFUN_COOKIE', title: 'StepFun' },
-  mimo: { loginUrl: 'https://platform.xiaomimimo.com/', envName: 'MIMO_COOKIE', title: '小米 MiMo' },
+  mimo: { loginUrl: 'https://platform.xiaomimimo.com/console/plan-manage', envName: 'MIMO_COOKIE', title: '小米 MiMo' },
 }
 
 async function resolveCredential(ctx, names) {
@@ -569,7 +569,11 @@ const LOGIN_TARGETS = {
     label: 'StepFun',
   },
   mimo: {
-    loginUrl: 'https://platform.xiaomimimo.com/',
+    // The console plan page, not the site root: `/` is a public product page
+    // that never signs anyone in — no SSO round trip, no login form. The
+    // console route requires auth, so it both bootstraps the SSO renewal on
+    // the parked browser and lands a signed-out session on the password form.
+    loginUrl: 'https://platform.xiaomimimo.com/console/plan-manage',
     domains: ['xiaomimimo.com', 'xiaomi.com', 'mi.com'],
     apiHost: 'platform.xiaomimimo.com',
     apiPath: '/api/v1/',
@@ -1048,7 +1052,11 @@ function createPipeClient(child) {
 const profileReleasedAt = new Map()
 const PROFILE_RELEASE_GRACE_MS = 2_000
 
-async function openBrowserPage({ headless, profileDir, url, seedCookies = [] }) {
+function cookieStorageKey(cookie) {
+  return `${String(cookie?.domain ?? '').toLowerCase()}${String(cookie?.path ?? '/')}\u0000${String(cookie?.name ?? '')}`
+}
+
+async function openBrowserPage({ headless, profileDir, url, seedCookies = [], overwriteCookies = [] }) {
   const browserPath = findBrowser()
   if (browserPath === null) {
     throw httpError(500, 'no Chromium browser found — install Chrome or Edge, or set DSH_QUOTA_BROWSER to its executable')
@@ -1097,11 +1105,29 @@ async function openBrowserPage({ headless, profileDir, url, seedCookies = [] }) 
     try {
       await cdp.send('Network.setUserAgentOverride', { userAgent: BROWSER_UA, acceptLanguage: 'zh-CN,zh;q=0.9' }, sessionId)
     } catch { /* older builds lack the override; the page still loads */ }
-    const sanitized = slimCookies(seedCookies)
-    if (sanitized.length > 0) {
-      // Resurrect the session cookies Chromium dropped on exit, before the
-      // console page's first request goes out.
-      try { await cdp.send('Network.setCookies', { cookies: sanitized }, sessionId) } catch { /* best effort */ }
+    // Resurrect the session cookies Chromium dropped on exit, before the
+    // console page's first request goes out. Jar seeds only fill cookies the
+    // profile does not already hold: the profile's own copy is the freshest.
+    // Xiaomi rotates its passToken on every SSO exchange, and the rotation
+    // lands in the browser profile at once but in the jar only after the next
+    // successful validation — an older jar must never overwrite the newer
+    // cookie the browser itself captured. Explicit overwrite cookies (a sync
+    // from the user's real browser) are authoritative by construction.
+    const overwrites = slimCookies(overwriteCookies)
+    if (overwrites.length > 0) {
+      try { await cdp.send('Network.setCookies', { cookies: overwrites }, sessionId) } catch { /* best effort */ }
+    }
+    const fills = slimCookies(seedCookies)
+    if (fills.length > 0) {
+      let present = null
+      try {
+        const existing = await cdp.send('Storage.getCookies', {}, sessionId)
+        present = new Set((existing.cookies ?? []).map((cookie) => cookieStorageKey(cookie)))
+      } catch { /* profile unreadable: seed everything */ }
+      const missing = fills.filter((cookie) => present === null || !present.has(cookieStorageKey(cookie)))
+      if (missing.length > 0) {
+        try { await cdp.send('Network.setCookies', { cookies: missing }, sessionId) } catch { /* best effort */ }
+      }
     }
     await cdp.send('Page.navigate', { url }, sessionId)
     return { cdp, sessionId, stop, browserPath }
@@ -1144,6 +1170,14 @@ function loginAutofillScript(username, password) {
   if (userInput === null) return 'waiting'
   if (userInput.value !== username) setValue(userInput, username)
   if (passwordInput.value !== password) setValue(passwordInput, password)
+  // A consent checkbox ("已阅读并同意…协议") gates the submit button on the
+  // Xiaomi account page: it stays disabled until the box is ticked, so the
+  // form can never be submitted without this click.
+  for (const box of document.querySelectorAll('input[type=checkbox]')) {
+    if (!visible(box) || box.checked) continue
+    const text = box.closest('label')?.textContent ?? box.parentElement?.textContent ?? ''
+    if (/协议|隐私|agree|terms|privacy/i.test(text)) box.click()
+  }
   const captcha = pick('#captchaCode, input[name="captcha"], input[placeholder*="验证码"], input[placeholder*="captcha" i], input[autocomplete="one-time-code"]')
   if (captcha !== null) return 'captcha'
   const submit = pick('#login-button, button[type="submit"], button.login-btn, .btn-primary, input[type="submit"]')
@@ -2172,13 +2206,10 @@ export function apply(ctx, config = {}) {
     const profileDir = profileDirFor(family, dataDir)
     if (!allowUnbound && !profileLooksBound(profileDir)) return
     const baseCookies = resurrectCookiesFor(family, profileDir, await secretFor(family, {}))
-    const seedCookies = extraSeedCookies.length > 0
-      ? mergeCookieLists(baseCookies, extraSeedCookies)
-      : baseCookies
     const stopsAtLaunch = keepAliveStops.get(family) ?? 0
     let page = null
     try {
-      page = await openBrowserPage({ headless: true, profileDir, url: target.loginUrl, seedCookies })
+      page = await openBrowserPage({ headless: true, profileDir, url: target.loginUrl, seedCookies: baseCookies, overwriteCookies: extraSeedCookies })
     } catch {
       return
     }
